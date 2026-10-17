@@ -71,7 +71,7 @@ protobuf==6.33.5
 pyarrow==23.0.1
 rank-bm25==0.2.2
 pydantic==2.12.5
-pydantic-settings==2.14.2
+pydantic-settings==2.16.0
 pydantic_core==2.41.5
 pydeck==0.9.1
 pyee==13.0.1
