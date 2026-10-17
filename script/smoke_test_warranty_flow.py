@@ -28,6 +28,7 @@ from typing import List, Tuple
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 APP_DIR = PROJECT_ROOT / "app"
+sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(APP_DIR))
 
 # Use an in-memory SQLite DB so smoke tests never touch the production DB.
@@ -66,13 +67,13 @@ FAIL = f"{RED}✗ FAIL{RESET}"
 SCENARIOS: List[Tuple[str, List[str], str, str]] = [
     (
         "Power issue — remote on, no response → replace remote (admin review)",
-        ["warranty", "defect", "power", "remote_on", "no_response"],
+        ["warranty", "defect", "power", "remote_on", "no_response", "error_code_no"],
         "awaiting_admin_review",
         "defect_power_remote_replace_terminal",
     ),
     (
         "Remote — blank screen, commands OK → admin review",
-        ["warranty", "defect", "remote", "has_power", "blank_screen_commands_ok"],
+        ["warranty", "defect", "remote", "has_power", "blank_screen_commands_ok", "error_code_no"],
         "awaiting_admin_review",
         "defect_remote_blank_screen_terminal",
     ),
@@ -84,15 +85,21 @@ SCENARIOS: List[Tuple[str, List[str], str, str]] = [
     ),
     (
         "Air issue — shoulders/hips, yes hissing → tech dispatch (admin review)",
-        ["warranty", "defect", "air", "shoulders_hips", "yes_hissing"],
+        ["warranty", "defect", "air", "shoulders_hips", "yes_hissing", "error_code_no"],
         "awaiting_admin_review",
         "defect_air_shoulders_tech_terminal",
     ),
     (
         "Delivery — tracking + box damage signed cleared → admin review",
-        ["warranty", "delivery", "has_tracking", "1Z999AA10123456784", "yes_box_damage", "signed_cleared"],
+        ["warranty", "delivery", "damage_issue", "has_tracking", "1Z999AA10123456784", "damaged_in_transit", "yes_box_damage", "signed_cleared"],
         "awaiting_admin_review",
         "delivery_signed_cleared_terminal",
+    ),
+    (
+        "Delivery — status check by email → admin review",
+        ["warranty", "delivery", "status_check", "no_tracking", "customer@example.com"],
+        "awaiting_admin_review",
+        "delivery_status_terminal",
     ),
 ]
 

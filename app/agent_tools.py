@@ -131,18 +131,36 @@ class HybridRetriever:
 # Tool implementations (pure functions; Agent calls them)
 # ============================================================================
 
-def _extract_price(text: str) -> Optional[float]:
+def _extract_price(text: str, *, title: Optional[str] = None) -> Optional[float]:
     """Extract the most likely actual chair price from a doc.
 
     Strategy:
-    1. Prefer 'Variant Price: $X' field if present (Shopify export schema).
-    2. Otherwise scan all $-prefixed numbers and pick the MAX in a reasonable
-       chair price band ($500-$50,000). Picking the min was wrong because docs
-       often contain monthly payment ($199/mo), warranty add-on ($99), or
-       shipping fee ($249) — all of which are far below the real chair price.
+    1. Prefer Shopify CSV base price when title matches product_catalog.
+    2. Prefer 'BASE PRICE (USD): $X' field if present (ingested docs).
+    3. Otherwise scan Variant Price / $ amounts in the chair price band.
     """
+    if title:
+        try:
+            from product_catalog import resolve_catalog_price
+            catalog_price = resolve_catalog_price(title)
+            if catalog_price is not None:
+                return catalog_price
+        except ImportError:
+            pass
+
     if not text:
         return None
+
+    base_match = re.search(
+        r"BASE PRICE \(USD\):\s*\$?(\d[\d,]*\.?\d*)", text, re.IGNORECASE
+    )
+    if base_match:
+        try:
+            v = float(base_match.group(1).replace(",", ""))
+            if 500 <= v <= 50000:
+                return v
+        except ValueError:
+            pass
 
     variant_match = re.search(r"Variant\s+Price[^\n$]*\$?(\d[\d,]*\.?\d*)", text, re.IGNORECASE)
     if variant_match:
@@ -168,6 +186,20 @@ def _extract_price(text: str) -> Optional[float]:
 
 def _extract_title(doc: Document) -> str:
     return doc.metadata.get("title") or doc.page_content.split("\n", 1)[0][:80]
+
+
+def _source_record(doc: Document) -> str:
+    """Compact provenance marker for grounding and customer citations."""
+    source = str(doc.metadata.get("source") or "internal knowledge base").strip()
+    updated = str(
+        doc.metadata.get("updated_at")
+        or doc.metadata.get("last_updated")
+        or ""
+    ).strip()
+    parts = [f"source={source[:300]}"]
+    if updated:
+        parts.append(f"updated={updated[:40]}")
+    return "SOURCE_RECORD: " + "; ".join(parts)
 
 
 # Keywords that map a user's query topic to matching spec column patterns
@@ -265,6 +297,16 @@ def tool_search_chair_specs(
       4. Final fallback: searching just on the alphanumeric core of the model
     """
     norm_model = _normalize_model_query(model_name) if model_name else None
+    if model_name:
+        try:
+            from product_catalog import resolve_model_name
+
+            canonical = resolve_model_name(model_name)
+            if canonical:
+                model_name = canonical
+                norm_model = _normalize_model_query(model_name)
+        except ImportError:
+            pass
     base_query = f"{model_name} {query}".strip() if model_name else query
 
     docs = products_retriever.search(base_query, k=5, model_hint=model_name)
@@ -310,6 +352,10 @@ def tool_search_chair_specs(
         auth_lines = _find_authoritative_lines(doc.page_content, query)
 
         lines.append(f"\n--- Result {i}: {title} ---")
+        lines.append(_source_record(doc))
+        base_price = _extract_price(doc.page_content, title=title)
+        if base_price is not None:
+            lines.append(f"BASE PRICE (USD): ${base_price:,.2f}")
         if auth_lines:
             lines.append("AUTHORITATIVE SPEC VALUES (use EXACTLY these numbers, do not paraphrase):")
             for al in auth_lines:
@@ -378,14 +424,14 @@ def tool_recommend_chairs(
             continue
         if any(ex and ex in title_lower for ex in excludes_norm):
             continue
-        price = _extract_price(doc.page_content)
+        price = _extract_price(doc.page_content, title=title)
         if price is None or price < MIN_REASONABLE_PRICE:
             continue
         if eff_min is not None and price < eff_min:
             continue
         if eff_max is not None and price > eff_max:
             continue
-        candidates.append((title, price, doc.page_content[:500]))
+        candidates.append((title, price, doc.page_content[:500], _source_record(doc)))
 
     if not candidates:
         return (
@@ -407,8 +453,8 @@ def tool_recommend_chairs(
         header += f" (target budget ~${budget_max:,.0f})"
     header += ":"
     lines = [header]
-    for i, (title, price, body) in enumerate(picks, 1):
-        lines.append(f"\n--- Pick {i}: {title} (${price:,.0f}) ---\n{body}")
+    for i, (title, price, body, source) in enumerate(picks, 1):
+        lines.append(f"\n--- Pick {i}: {title} (${price:,.0f}) ---\n{source}\n{body}")
     lines.append(
         "\nIMPORTANT: Quote ONLY the prices shown above. Do NOT recall prices from training data."
     )
@@ -422,14 +468,38 @@ def tool_get_repair_help(
     error_code: Optional[str] = None,
 ) -> str:
     """Look up repair / error code information."""
+    suppress = "\nFOOTER_HINT: SUPPRESS_LEAD_FOOTER (this is a service issue, do not pitch sales)."
+
+    try:
+        from error_code_lookup import (  # noqa: WPS433
+            extract_error_codes_from_text,
+            format_repair_help,
+            lookup_error_code,
+        )
+
+        codes: list[str] = []
+        if error_code and str(error_code).strip():
+            codes.append(str(error_code).strip())
+        codes.extend(extract_error_codes_from_text(issue_description))
+        seen: set[str] = set()
+        for code in codes:
+            norm = code.upper().replace(" ", "")
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            hit = lookup_error_code(None, norm)
+            if hit:
+                return format_repair_help(hit) + suppress
+    except ImportError:
+        pass
+
     query = f"error code {error_code} {issue_description}" if error_code else issue_description
     docs = qa_retriever.search(query, k=5)
-    suppress = "\nFOOTER_HINT: SUPPRESS_LEAD_FOOTER (this is a service issue, do not pitch sales)."
     if not docs:
         return "NO_RESULTS: No specific repair guide found." + suppress
     lines = ["Relevant repair / error info:"]
     for i, doc in enumerate(docs, 1):
-        lines.append(f"\n[{i}] {doc.page_content[:800]}")
+        lines.append(f"\n[{i}] {_source_record(doc)}\n{doc.page_content[:800]}")
     lines.append(suppress)
     return "\n".join(lines)
 
@@ -458,7 +528,7 @@ def tool_get_warranty_or_policy(
         return "NO_RESULTS: No policy information found for this topic." + suppress
     lines = [f"Policy info for '{topic}':"]
     for i, doc in enumerate(docs, 1):
-        lines.append(f"\n[{i}] {doc.page_content[:800]}")
+        lines.append(f"\n[{i}] {_source_record(doc)}\n{doc.page_content[:800]}")
     if suppress:
         lines.append(suppress)
     return "\n".join(lines)
@@ -494,7 +564,7 @@ def tool_capture_sales_lead(
         args=(customer_email, interest_summary, "", target_domain),
         daemon=True,
     ).start()
-    logger.info(f"📧 [Tool] Sales lead captured: {customer_email} on {target_domain}")
+    logger.info("📧 [Tool] Sales lead captured for domain=%s", target_domain)
     return f"SUCCESS: Forwarded {customer_email} to sales team. They will respond within 24 hours."
 
 
@@ -517,7 +587,14 @@ def tool_get_showroom_info(*, target_domain: str) -> str:
     )
 
 
-def _format_warranty_node(ticket_id: str, node: dict, is_start: bool = False) -> str:
+def _format_warranty_node(
+    ticket_id: str,
+    node: dict,
+    *,
+    engine=None,
+    ticket=None,
+    is_start: bool = False,
+) -> str:
     """Format a non-terminal warranty node for the LLM to paraphrase."""
     header = "WARRANTY_TICKET_STARTED" if is_start else "WARRANTY_CONTINUE"
     lines = [
@@ -534,16 +611,103 @@ def _format_warranty_node(ticket_id: str, node: dict, is_start: bool = False) ->
             lines.append(f"  - answer_key={opt.get('answer_key', '?')} | Label: {opt['label']}")
     else:
         lines.append("OPTIONS: (free text — accept any input)")
-    lines += [
-        "",
-        "INSTRUCTION: Present the PROMPT to the customer in a warm, friendly tone.",
-        "When the customer responds, map their answer to the closest answer_key and call answer_warranty_question.",
-        "DO NOT make any warranty decision yourself. SUPPRESS_LEAD_FOOTER",
-    ]
+
+    if engine is not None and ticket is not None:
+        enrich_lines, has_customer_message = _enrichment_tool_lines(
+            engine=engine,
+            ticket=ticket,
+            node=node,
+        )
+        lines.extend(enrich_lines)
+    else:
+        has_customer_message = False
+
+    if not has_customer_message:
+        lines += [
+            "",
+            "INSTRUCTION: Present the PROMPT to the customer verbatim (same meaning). "
+            "Present OPTIONS exactly as listed. "
+            "When the customer responds, map their answer to the closest answer_key and call answer_warranty_question. "
+            "DO NOT make any warranty decision yourself. DO NOT invent steps or outcomes. SUPPRESS_LEAD_FOOTER",
+        ]
+    else:
+        lines += [
+            "",
+            "INSTRUCTION: Deliver CUSTOMER_MESSAGE to the customer verbatim (same facts and workflow question). "
+            "When the customer responds, map their answer to the closest answer_key and call answer_warranty_question. "
+            "DO NOT make any warranty decision yourself. DO NOT invent steps or outcomes. SUPPRESS_LEAD_FOOTER",
+        ]
     return "\n".join(lines)
 
 
-def _format_warranty_result(ticket_id: str, result: dict) -> str:
+def _enrichment_tool_lines(*, engine, ticket, node: dict) -> tuple[list[str], bool]:
+    from warranty_assistant_message import build_assistant_message_bundle  # noqa: WPS433
+
+    bundle = build_assistant_message_bundle(engine=engine, ticket=ticket, node=node)
+    message = str(bundle.get("assistant_message") or "").strip()
+    if not message:
+        return ["", "CUSTOMER_MESSAGE: (none — use PROMPT above)"], False
+    return ["", "CUSTOMER_MESSAGE:", message], True
+
+
+def _terminal_instruction_lines(
+    *,
+    terminal_class: str,
+    evidence: list,
+    evidence_email: str,
+    has_customer_message: bool,
+) -> list[str]:
+    if has_customer_message:
+        lines = [
+            "INSTRUCTION: Deliver CUSTOMER_MESSAGE to the customer verbatim. "
+            "Do NOT invent repair steps, parts, replacements, or outcomes beyond CUSTOMER_MESSAGE. "
+        ]
+        if terminal_class == "awaiting_admin_review":
+            lines[0] += (
+                "DO NOT promise replacement, tech dispatch, compensation, refund, or approval. "
+            )
+            if "video_of_issue" in evidence:
+                email = evidence_email or "service@osakititan.com"
+                lines[0] += (
+                    f"Also ask the customer to send a photo or video of the issue to {email}. "
+                )
+            lines[0] += "AWAITING_ADMIN_REVIEW=TRUE"
+        return lines
+
+    if terminal_class == "awaiting_admin_review":
+        evidence_hint = ""
+        if "video_of_issue" in evidence:
+            email = evidence_email or "service@osakititan.com"
+            evidence_hint = (
+                f" Also ask the customer to send a photo or video of the issue to {email}."
+            )
+        return [
+            "INSTRUCTION: Deliver the PROMPT_FOR_CUSTOMER verbatim. "
+            "DO NOT promise replacement, tech dispatch, compensation, refund, or any approval. "
+            "The prompt already says 'our team will review' — keep that language exactly."
+            + evidence_hint
+            + " AWAITING_ADMIN_REVIEW=TRUE"
+        ]
+    if terminal_class == "send_info":
+        return [
+            "INSTRUCTION: Deliver the PROMPT_FOR_CUSTOMER. "
+            "This is a self-service step — you may briefly explain the how-to if helpful."
+        ]
+    if terminal_class in ("awaiting_evidence", "request_evidence"):
+        return [
+            f"INSTRUCTION: Ask customer to send the evidence to {evidence_email or 'service@osakititan.com'}. "
+            "Tell them someone will follow up after review."
+        ]
+    return ["INSTRUCTION: Deliver the PROMPT_FOR_CUSTOMER verbatim."]
+
+
+def _format_warranty_result(
+    ticket_id: str,
+    result: dict,
+    *,
+    engine=None,
+    ticket=None,
+) -> str:
     """Format a warranty transition result for the LLM to paraphrase."""
     next_node = result["next_node"]
     is_terminal = result["is_terminal"]
@@ -567,32 +731,22 @@ def _format_warranty_result(ticket_id: str, result: dict) -> str:
             lines.append(f"EVIDENCE_SEND_TO: {evidence_email}")
         lines.append(f"INTERNAL_NOTE: {internal_note}")
         lines += [""]
-        if terminal_class == "awaiting_admin_review":
-            evidence_hint = ""
-            if "video_of_issue" in evidence:
-                email = evidence_email or "service@osakititan.com"
-                evidence_hint = (
-                    f" Also ask the customer to send a photo or video of the issue to {email}."
-                )
-            lines.append(
-                "INSTRUCTION: Deliver the PROMPT_FOR_CUSTOMER verbatim. "
-                "DO NOT promise replacement, tech dispatch, compensation, refund, or any approval. "
-                "The prompt already says 'our team will review' — keep that language exactly."
-                + evidence_hint
-                + " AWAITING_ADMIN_REVIEW=TRUE"
+        has_customer_message = False
+        if engine is not None and ticket is not None:
+            enrich_lines, has_customer_message = _enrichment_tool_lines(
+                engine=engine,
+                ticket=ticket,
+                node=next_node,
             )
-        elif terminal_class == "send_info":
-            lines.append(
-                "INSTRUCTION: Deliver the PROMPT_FOR_CUSTOMER. "
-                "This is a self-service step — you may briefly explain the how-to if helpful."
+            lines.extend(enrich_lines)
+        lines.extend(
+            _terminal_instruction_lines(
+                terminal_class=str(terminal_class),
+                evidence=list(evidence),
+                evidence_email=str(evidence_email or ""),
+                has_customer_message=has_customer_message,
             )
-        elif terminal_class in ("awaiting_evidence", "request_evidence"):
-            lines.append(
-                f"INSTRUCTION: Ask customer to send the evidence to {evidence_email or 'service@osakititan.com'}. "
-                "Tell them someone will follow up after review."
-            )
-        else:
-            lines.append("INSTRUCTION: Deliver the PROMPT_FOR_CUSTOMER verbatim.")
+        )
         lines.append("SUPPRESS_LEAD_FOOTER")
         return "\n".join(lines)
 
@@ -611,16 +765,96 @@ def _format_warranty_result(ticket_id: str, result: dict) -> str:
             lines.append(f"  - answer_key={opt.get('answer_key', '?')} | Label: {opt['label']}")
     else:
         lines.append("OPTIONS: (free text — accept any input)")
-    lines += [
-        "",
-        "INSTRUCTION: Present PROMPT and OPTIONS to customer in a warm, friendly tone.",
-        "When they respond, call warranty_answer with the matching answer_key.",
-        "DO NOT make any warranty decision yourself. SUPPRESS_LEAD_FOOTER",
-    ]
+
+    if engine is not None and ticket is not None:
+        enrich_lines, has_customer_message = _enrichment_tool_lines(
+            engine=engine,
+            ticket=ticket,
+            node=next_node,
+        )
+        lines.extend(enrich_lines)
+    else:
+        has_customer_message = False
+
+    if not has_customer_message:
+        lines += [
+            "",
+            "INSTRUCTION: Present PROMPT and OPTIONS verbatim (same meaning). "
+            "When they respond, call warranty_answer with the matching answer_key. "
+            "DO NOT make any warranty decision yourself. DO NOT invent steps or outcomes. SUPPRESS_LEAD_FOOTER",
+        ]
+    else:
+        lines += [
+            "",
+            "INSTRUCTION: Deliver CUSTOMER_MESSAGE to the customer verbatim (same facts and workflow question). "
+            "When they respond, call warranty_answer with the matching answer_key. "
+            "DO NOT make any warranty decision yourself. DO NOT invent steps or outcomes. SUPPRESS_LEAD_FOOTER",
+        ]
     return "\n".join(lines)
 
 
-def tool_start_warranty_workflow(*, session_id: str, domain: str) -> str:
+def _format_warranty_side_question(ticket_id: str, message: str) -> str:
+    return "\n".join([
+        "WARRANTY_SIDE_QUESTION",
+        f"TICKET_ID: {ticket_id}",
+        "CUSTOMER_MESSAGE:",
+        message.strip(),
+        "",
+        "INSTRUCTION: Deliver CUSTOMER_MESSAGE to the customer verbatim. "
+        "The workflow did NOT advance — wait for their answer to the current question. "
+        "DO NOT make any warranty decision yourself. DO NOT invent steps or outcomes. "
+        "SUPPRESS_LEAD_FOOTER",
+    ])
+
+
+def _submit_warranty_answer_with_fallback(
+    engine,
+    ticket_id: str,
+    answer_key: str,
+    customer_text: str = "",
+) -> dict:
+    """Submit answer_key; on mismatch optionally map customer_text via NLP."""
+    try:
+        return engine.submit_answer(ticket_id, answer_key)
+    except ValueError as exc:
+        msg = str(exc)
+        if "did not match any option" not in msg:
+            raise
+
+        raw = (customer_text or "").strip()
+        if not raw:
+            raise
+
+        node = engine.get_current_node(ticket_id)
+        if not node:
+            raise
+
+        from warranty_nlp import interpret_warranty_answer  # noqa: WPS433
+
+        mapped = interpret_warranty_answer(node, raw)
+        if not mapped:
+            raise
+
+        # Text-capture nodes may normalize typed input. Option menus advance
+        # only when NLP/heuristics find a unique valid answer_key.
+        if node.get("type") == "question_text":
+            return engine.submit_answer(
+                ticket_id,
+                mapped,
+                customer_display=raw,
+            )
+
+        if mapped == answer_key:
+            raise
+
+        return engine.submit_answer(
+            ticket_id,
+            mapped,
+            customer_display=raw,
+        )
+
+
+def tool_start_warranty_workflow(*, session_id: str, domain: str, issue_hint: str = "") -> str:
     """Start a new warranty intake session and return the first question node."""
     # Runtime validation
     if not session_id or not isinstance(session_id, str):
@@ -635,8 +869,26 @@ def tool_start_warranty_workflow(*, session_id: str, domain: str) -> str:
 
     try:
         ticket_id, node = WarrantyEngine.start_session(session_id, domain or "unknown")
+        ticket = WarrantyEngine.get_ticket(ticket_id)
+        hint = str(issue_hint or "").strip()
+        if hint and ticket is not None:
+            from warranty_intake_context import persist_intake_summary  # noqa: WPS433
+
+            persist_intake_summary(ticket, summary=hint, raw_message=hint)
+            collected = ticket.collected_data
+            WarrantyEngine.persist_collected_data(
+                ticket_id,
+                collected if isinstance(collected, str) else str(collected or "{}"),
+            )
+            ticket = WarrantyEngine.get_ticket(ticket_id)
         logger.info(f"🎫 Warranty started — session={session_id} ticket={ticket_id} domain={domain}")
-        return _format_warranty_node(ticket_id, node, is_start=True)
+        return _format_warranty_node(
+            ticket_id,
+            node,
+            engine=WarrantyEngine,
+            ticket=ticket,
+            is_start=True,
+        )
     except Exception as e:
         logger.error(f"start_warranty_workflow error: {e}")
         return f"WARRANTY_ERROR: {e}"
@@ -646,7 +898,12 @@ def tool_start_warranty_workflow(*, session_id: str, domain: str) -> str:
 tool_warranty_start = tool_start_warranty_workflow
 
 
-def tool_answer_warranty_question(*, ticket_id: str, answer_key: str) -> str:
+def tool_answer_warranty_question(
+    *,
+    ticket_id: str,
+    answer_key: str,
+    customer_text: str = "",
+) -> str:
     """Submit the customer's answer to the current warranty node and advance the workflow."""
     # Runtime validation
     if not ticket_id or not isinstance(ticket_id, str):
@@ -661,15 +918,38 @@ def tool_answer_warranty_question(*, ticket_id: str, answer_key: str) -> str:
     except Exception as e:
         return f"WARRANTY_UNAVAILABLE: {e}"
 
+    side_probe = (customer_text or answer_key or "").strip()
+    if side_probe:
+        from warranty_intake_context import try_side_question_for_ticket  # noqa: WPS433
+
+        side_message = try_side_question_for_ticket(WarrantyEngine, ticket_id, side_probe)
+        if side_message:
+            logger.info(
+                f"🎫 Warranty side question — ticket={ticket_id} "
+                f"probe={side_probe[:80]!r}"
+            )
+            return _format_warranty_side_question(ticket_id, side_message)
+
     try:
-        result = WarrantyEngine.submit_answer(ticket_id, answer_key)
+        result = _submit_warranty_answer_with_fallback(
+            WarrantyEngine,
+            ticket_id,
+            answer_key,
+            customer_text=customer_text,
+        )
+        ticket = WarrantyEngine.get_ticket(ticket_id)
         logger.info(
             f"🎫 Warranty answer — ticket={ticket_id} answer_key={answer_key} "
             f"next_node={result.get('next_node_id')} terminal={result.get('is_terminal')} "
             f"terminal_class={result.get('terminal_class')} "
             f"awaiting_admin={result.get('terminal_class') == 'awaiting_admin_review'}"
         )
-        return _format_warranty_result(ticket_id, result)
+        return _format_warranty_result(
+            ticket_id,
+            result,
+            engine=WarrantyEngine,
+            ticket=ticket,
+        )
     except ValueError as e:
         # Answer didn't match — give the LLM the valid options so it can ask again
         try:
@@ -986,8 +1266,16 @@ TOOL_SCHEMAS: List[Any] = [
                             "Must exactly match one of the answer_key values listed in OPTIONS."
                         ),
                     },
+                    "customer_text": {
+                        "type": "string",
+                        "description": (
+                            "The customer's exact message for this turn. Required so side "
+                            "questions (specs, box size, general FAQ) can be answered without "
+                            "advancing the workflow."
+                        ),
+                    },
                 },
-                "required": ["ticket_id", "answer_key"],
+                "required": ["ticket_id", "answer_key", "customer_text"],
             },
         },
     },
@@ -1044,6 +1332,30 @@ TOOL_SCHEMAS: List[Any] = [
         },
     },
 ]
+
+
+def _enable_strict_tool_schemas(schemas: List[Any]) -> None:
+    """Make Chat Completions function calls conform to their JSON schemas."""
+    for schema in schemas:
+        function = schema["function"]
+        parameters = function["parameters"]
+        properties = parameters.get("properties", {})
+        originally_required = set(parameters.get("required", []))
+        for name, prop in properties.items():
+            if name in originally_required:
+                continue
+            prop_type = prop.get("type")
+            if isinstance(prop_type, str):
+                prop["type"] = [prop_type, "null"]
+            enum = prop.get("enum")
+            if isinstance(enum, list) and None not in enum:
+                enum.append(None)
+        parameters["required"] = list(properties.keys())
+        parameters["additionalProperties"] = False
+        function["strict"] = True
+
+
+_enable_strict_tool_schemas(TOOL_SCHEMAS)
 
 # ---------------------------------------------------------------------------
 # Warranty-mode tool subset

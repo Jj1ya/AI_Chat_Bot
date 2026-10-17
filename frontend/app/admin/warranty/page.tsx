@@ -9,12 +9,13 @@ import { notFound } from "next/navigation";
 import Link from "next/link";
 import AdminTicketQueue from "@/components/admin/AdminTicketQueue";
 import AdminQueueFilters from "@/components/admin/AdminQueueFilters";
+import AdminFreshdeskSync from "@/components/admin/AdminFreshdeskSync";
 import type { TicketListResponse } from "@/lib/adminTypes";
 import { getBackendUrl } from "@/lib/backendUrl";
 
 const BACKEND = getBackendUrl();
 
-async function fetchTickets(status?: string): Promise<TicketListResponse> {
+async function fetchTickets(status?: string, channel?: string): Promise<TicketListResponse> {
   const adminKey = process.env.ADMIN_API_KEY;
   if (!adminKey) {
     return { total: 0, offset: 0, tickets: [] };
@@ -22,6 +23,7 @@ async function fetchTickets(status?: string): Promise<TicketListResponse> {
 
   const qs = new URLSearchParams({ limit: "100" });
   if (status) qs.set("status", status);
+  if (channel) qs.set("channel", channel);
 
   const res = await fetch(`${BACKEND}/admin/warranty/tickets?${qs}`, {
     headers: { "X-Admin-Key": adminKey },
@@ -40,16 +42,16 @@ async function fetchTickets(status?: string): Promise<TicketListResponse> {
 export default async function AdminWarrantyQueuePage({
   searchParams,
 }: {
-  searchParams: Promise<{ status?: string }>;
+  searchParams: Promise<{ status?: string; channel?: string }>;
 }) {
-  const { status } = await searchParams;
+  const { status, channel } = await searchParams;
   const adminConfigured = !!process.env.ADMIN_API_KEY;
 
   let data: TicketListResponse = { total: 0, offset: 0, tickets: [] };
   let fetchError: string | null = null;
 
   try {
-    data = await fetchTickets(status);
+    data = await fetchTickets(status, channel);
   } catch {
     fetchError = "Failed to load tickets from the backend.";
   }
@@ -63,7 +65,7 @@ export default async function AdminWarrantyQueuePage({
             ← Home
           </Link>
           <span className="text-gray-300">|</span>
-          <div>
+          <div className="flex-1">
             <h1 className="text-base font-semibold text-gray-900">
               🔐 Admin — Warranty Tickets
             </h1>
@@ -71,6 +73,18 @@ export default async function AdminWarrantyQueuePage({
               INTERNAL USE ONLY — Do not share this page
             </p>
           </div>
+          <Link
+            href="/admin/warranty/dashboard"
+            className="rounded-md border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-100"
+          >
+            Completion dashboard →
+          </Link>
+          <Link
+            href="/admin/ops"
+            className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-800 hover:bg-indigo-100"
+          >
+            Cost & feedback →
+          </Link>
         </div>
       </header>
 
@@ -92,7 +106,10 @@ export default async function AdminWarrantyQueuePage({
         </div>
 
         {/* Filters + refresh */}
-        <AdminQueueFilters currentStatus={status} total={data.total} />
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <AdminQueueFilters currentStatus={status} currentChannel={channel} total={data.total} />
+          <AdminFreshdeskSync />
+        </div>
 
         {/* Fetch error */}
         {fetchError && (

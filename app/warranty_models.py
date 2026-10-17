@@ -13,22 +13,24 @@ Tables
   warranty_turns      – one row per Q&A step within a session
   warranty_evidences  – uploaded evidence files (photos, videos, receipts)
   warranty_decisions  – admin decisions recorded against a ticket
+  ringcentral_webhook_events – durable, idempotent webhook inbox
+  ringcentral_call_states     – restart-safe IVR call state
 """
 
 from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Generator, cast
+from typing import Generator, Optional, cast
 
 import pytz
 from sqlalchemy import (
     Column, DateTime, Integer, String, Text,
-    create_engine,
+    create_engine, event,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import Mapped, declarative_base, mapped_column, sessionmaker
 
 # ---------------------------------------------------------------------------
 # DB setup — same file as main.py, independent engine/session factory
@@ -40,8 +42,19 @@ _DATABASE_URL = f"sqlite:///{_DB_DIR}/chat_history.db"
 
 _engine = create_engine(
     _DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
+    pool_pre_ping=True,
 )
+
+
+@event.listens_for(_engine, "connect")
+def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 _SessionFactory = sessionmaker(
     autocommit=False,
@@ -69,6 +82,11 @@ def warranty_db_session() -> Generator:
 
 def _now_cst() -> datetime:
     return datetime.now(pytz.timezone("America/Chicago"))
+
+
+def _now_utc() -> datetime:
+    """Return naive UTC for internal retry/lease timestamps."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +166,21 @@ class WarrantyTicket(Base):
         }
 
 
+class WarrantyChatConsent(Base):
+    """Customer acceptance of live-chat privacy / recording notice (per browser session)."""
+
+    __tablename__ = "warranty_chat_consents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, unique=True, index=True, nullable=False)
+    domain = Column(String, index=True, default="unknown")
+    policy_store = Column(String, nullable=True)
+    contact_email = Column(String, nullable=True)
+    email_gate_status = Column(String, nullable=True)  # provided | skipped
+    accepted_at = Column(DateTime, default=_now_cst)
+    updated_at = Column(DateTime, default=_now_cst, onupdate=_now_cst)
+
+
 class WarrantyTurn(Base):
     """One Q&A exchange within a warranty ticket (node visited + answer given)."""
 
@@ -187,7 +220,8 @@ class WarrantyEvidence(Base):
     original_filename = Column(String,  nullable=True)
     mime_type         = Column(String,  nullable=True)
     file_size_bytes   = Column(Integer, default=0)
-    emailed           = Column(Integer, default=0)       # 1 = forwarded to service@osakititan.com
+    emailed           = Column(Integer, default=0)       # 1 = warranty team notified
+    customer_email    = Column(String, nullable=True)    # email entered on upload form
     created_at        = Column(DateTime, default=_now_cst)
 
     def to_dict(self) -> dict:
@@ -199,9 +233,61 @@ class WarrantyEvidence(Base):
             "original_filename": self.original_filename,
             "mime_type":         self.mime_type,
             "file_size_bytes":   self.file_size_bytes,
+            "customer_email":    self.customer_email,
             "emailed":           bool(self.emailed),
             "created_at":        cast(datetime, self.created_at).isoformat() if self.created_at is not None else None,
         }
+
+    def to_dict_public(self) -> dict:
+        """Browser-safe evidence metadata (no server filesystem paths)."""
+        return {
+            "id":                self.id,
+            "ticket_id":         self.ticket_id,
+            "evidence_type":     self.evidence_type,
+            "original_filename": self.original_filename,
+            "mime_type":         self.mime_type,
+            "file_size_bytes":   self.file_size_bytes,
+            "emailed":           bool(self.emailed),
+            "created_at":        cast(datetime, self.created_at).isoformat() if self.created_at is not None else None,
+        }
+
+
+class RingCentralWebhookEvent(Base):
+    """Durable inbox row for an inbound RingCentral callback."""
+
+    __tablename__ = "ringcentral_webhook_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_key = Column(String, unique=True, index=True, nullable=False)
+    route = Column(String, index=True, nullable=False)
+    session_id = Column(String, index=True, nullable=True)
+    payload_json = Column(Text, nullable=False)
+    status = Column(String, index=True, default="pending", nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    last_error = Column(String, nullable=True)
+    next_attempt_at = Column(DateTime, index=True, nullable=True)
+    created_at = Column(DateTime, default=_now_utc)
+    updated_at = Column(DateTime, default=_now_utc, onupdate=_now_utc)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class RingCentralCallState(Base):
+    """Persistent mirror of the active in-memory IVR call context."""
+
+    __tablename__ = "ringcentral_call_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    session_id: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
+    party_id: Mapped[str] = mapped_column(String, nullable=False)
+    ticket_id: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    caller_phone: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    phase: Mapped[str] = mapped_column(String, nullable=False)
+    awaiting_command: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    last_audio_key: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=_now_utc)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, default=_now_utc, onupdate=_now_utc
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +295,33 @@ class WarrantyEvidence(Base):
 # ---------------------------------------------------------------------------
 
 Base.metadata.create_all(bind=_engine)
+
+
+def _migrate_warranty_schema() -> None:
+    """Add columns introduced after initial deploy (SQLite ALTER TABLE)."""
+    with _engine.connect() as conn:
+        raw = conn.connection.driver_connection
+        cursor = raw.cursor()
+        cursor.execute("PRAGMA table_info(warranty_evidences)")
+        cols = {row[1] for row in cursor.fetchall()}
+        if "customer_email" not in cols:
+            cursor.execute(
+                "ALTER TABLE warranty_evidences ADD COLUMN customer_email TEXT"
+            )
+            raw.commit()
+
+        cursor.execute("PRAGMA table_info(warranty_chat_consents)")
+        consent_cols = {row[1] for row in cursor.fetchall()}
+        if "contact_email" not in consent_cols:
+            cursor.execute(
+                "ALTER TABLE warranty_chat_consents ADD COLUMN contact_email TEXT"
+            )
+            raw.commit()
+        if "email_gate_status" not in consent_cols:
+            cursor.execute(
+                "ALTER TABLE warranty_chat_consents ADD COLUMN email_gate_status TEXT"
+            )
+            raw.commit()
+
+
+_migrate_warranty_schema()

@@ -9,11 +9,19 @@ APP_DIR = Path(__file__).resolve().parent.parent / "app"
 sys.path.insert(0, str(APP_DIR))
 
 from warranty_email import (  # noqa: E402
+    build_admin_decision_customer_body,
+    build_customer_receipt_body,
     build_evidence_notification_body,
+    build_phone_ivr_team_email_body,
     build_transcript_body,
     extract_email,
+    maybe_send_admin_decision_customer_email,
+    maybe_send_customer_receipt_email,
     maybe_send_warranty_transcript,
+    resolve_customer_email,
+    send_admin_decision_customer_email,
     send_evidence_upload_notification,
+    send_phone_ivr_team_email,
 )
 
 
@@ -64,6 +72,39 @@ def test_build_transcript_body_includes_turns():
     assert "My chair is broken" in body
 
 
+def test_build_phone_ivr_team_email_body_includes_caller_and_turns():
+    body = build_phone_ivr_team_email_body(
+        caller_phone="+15551234567",
+        session_id="rc-session-1",
+        ticket_id="T-IVR-1",
+        case_reference="WR-20260701-ABC123",
+        ticket_status="in_progress",
+        issue_type="defect",
+        model_name="OS-4000T",
+        current_node_id="defect_air",
+        turns=[FakeTurn("defect_problem_type", "What type of problem?", "1")],
+        sms_sent=True,
+    )
+    assert "+15551234567" in body
+    assert "WR-20260701-ABC123" in body
+    assert "What type of problem?" in body
+    assert "Sent to caller's phone number." in body
+    assert "After-hours warranty phone IVR" in body
+
+
+def test_send_phone_ivr_team_email_skips_without_smtp_config(monkeypatch):
+    monkeypatch.setattr("warranty_email.EMAIL_SENDER", "")
+    monkeypatch.setattr("warranty_email.EMAIL_PASSWORD", "")
+    assert (
+        send_phone_ivr_team_email(
+            caller_phone="+15551234567",
+            session_id="rc-session-2",
+            ticket_id="T-IVR-2",
+        )
+        is False
+    )
+
+
 def test_maybe_send_records_collected_data(monkeypatch):
     ticket = FakeTicket()
     sent_calls = []
@@ -104,7 +145,31 @@ def test_maybe_send_skips_duplicate(monkeypatch):
     assert sent is False
 
 
-def test_build_evidence_notification_body():
+def test_maybe_send_stores_email_even_when_smtp_fails(monkeypatch):
+    ticket = FakeTicket()
+    monkeypatch.setattr(
+        "warranty_email.send_warranty_transcript_email",
+        lambda **_k: False,
+    )
+
+    email, sent = maybe_send_warranty_transcript(
+        ticket=ticket,
+        answer_text="buyer@example.com",
+        turns=[],
+    )
+    assert email == "buyer@example.com"
+    assert sent is False
+    assert ticket.get_collected()["customer_contact_email"] == "buyer@example.com"
+
+
+def test_resolve_customer_email_from_collected_and_turns():
+    ticket = FakeTicket()
+    ticket.set_collected("order_or_email", "akhattakster@gmail.com")
+    assert resolve_customer_email(ticket) == "akhattakster@gmail.com"
+
+    ticket2 = FakeTicket()
+    turn = FakeTurn("delivery_get_name", "Order?", "buyer@example.com")
+    assert resolve_customer_email(ticket2, turns=[turn]) == "buyer@example.com"
     body = build_evidence_notification_body(
         ticket_id="T-99",
         customer_email="buyer@example.com",
@@ -151,6 +216,14 @@ def test_send_evidence_upload_notification(monkeypatch, tmp_path):
     monkeypatch.setattr("warranty_email.EMAIL_SENDER", "bot@example.com")
     monkeypatch.setattr("warranty_email.EMAIL_PASSWORD", "secret")
     monkeypatch.setattr("warranty_email.smtplib.SMTP", FakeSMTP)
+    monkeypatch.setattr(
+        "warranty_email._resolve_case_summary",
+        lambda **_k: {
+            "summary": "Test summary for evidence upload.",
+            "suggested_subject": "OS-4000T test",
+            "source": "deterministic",
+        },
+    )
 
     ok = send_evidence_upload_notification(
         ticket_id="T-55",
@@ -168,3 +241,180 @@ def test_send_evidence_upload_notification(monkeypatch, tmp_path):
     assert msg["To"] == "team@example.com"
     assert msg["Reply-To"] == "buyer@example.com"
     assert "T-55" in msg["Subject"]
+    part = msg.get_payload()[0]
+    body_text = part.get_payload(decode=True).decode("utf-8")
+    assert "Test summary for evidence upload." in body_text
+
+
+def test_build_admin_decision_customer_body_excludes_internal_note():
+    body = build_admin_decision_customer_body(
+        ticket_id="WR-100",
+        customer_message="Your replacement has been approved.",
+        model_name="OS-4000T",
+        issue_type="defect",
+    )
+    assert "Your replacement has been approved." in body
+    assert "WR-100" in body
+    assert "OS-4000T" in body
+    assert "defect" in body
+    assert "Internal" not in body
+
+
+def test_maybe_send_admin_decision_skips_without_message():
+    ticket = FakeTicket()
+    ticket.set_collected("customer_contact_email", "buyer@example.com")
+    sent, reason = maybe_send_admin_decision_customer_email(
+        ticket=ticket,
+        decision="approved",
+        customer_message="",
+    )
+    assert sent is False
+    assert reason == "no_customer_message"
+
+
+def test_maybe_send_admin_decision_skips_admin_reviewing():
+    ticket = FakeTicket()
+    ticket.set_collected("customer_contact_email", "buyer@example.com")
+    sent, reason = maybe_send_admin_decision_customer_email(
+        ticket=ticket,
+        decision="admin_reviewing",
+        customer_message="We are reviewing your case.",
+    )
+    assert sent is False
+    assert reason == "decision_not_notifiable"
+
+
+def test_maybe_send_admin_decision_sends_when_ready(monkeypatch):
+    ticket = FakeTicket()
+    ticket.set_collected("customer_contact_email", "buyer@example.com")
+    calls = []
+
+    def fake_send(**kwargs):
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("warranty_email.send_admin_decision_customer_email", fake_send)
+
+    sent, reason = maybe_send_admin_decision_customer_email(
+        ticket=ticket,
+        decision="approved",
+        customer_message="Your claim is approved.",
+    )
+    assert sent is True
+    assert reason is None
+    assert len(calls) == 1
+    assert calls[0]["to_email"] == "buyer@example.com"
+    assert calls[0]["customer_message"] == "Your claim is approved."
+    assert calls[0]["decision"] == "approved"
+
+
+def test_send_admin_decision_customer_email_sets_reply_to_team(monkeypatch):
+    sent_messages = []
+
+    class FakeSMTP:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ehlo(self):
+            return None
+
+        def starttls(self):
+            return None
+
+        def login(self, *_args, **_kwargs):
+            return None
+
+        def send_message(self, msg):
+            sent_messages.append(msg)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr("warranty_email.EMAIL_SENDER", "bot@example.com")
+    monkeypatch.setattr("warranty_email.EMAIL_PASSWORD", "secret")
+    monkeypatch.setattr("warranty_email.WARRANTY_TEAM_EMAIL", "service@osakititan.com")
+    monkeypatch.setattr("warranty_email.smtplib.SMTP", FakeSMTP)
+
+    ok = send_admin_decision_customer_email(
+        to_email="buyer@example.com",
+        ticket_id="WR-77",
+        decision="rejected",
+        customer_message="We cannot approve this claim.",
+    )
+    assert ok is True
+    assert len(sent_messages) == 1
+    msg = sent_messages[0]
+    assert msg["To"] == "buyer@example.com"
+    assert msg["Reply-To"] == "service@osakititan.com"
+    assert "Not approved" in msg["Subject"]
+    assert "WR-77" in msg["Subject"]
+
+
+def test_build_customer_receipt_body_includes_case_ref():
+    body = build_customer_receipt_body(
+        case_reference="WR-20260724-ABCDEF",
+        customer_email="buyer@example.com",
+        model_name="OS-4000T",
+        issue_type="defect",
+    )
+    assert "WR-20260724-ABCDEF" in body
+    assert "buyer@example.com" in body
+    assert "OS-4000T" in body
+    assert "What happens next" in body
+    assert "Check status anytime" in body
+
+
+def test_build_customer_receipt_body_includes_status_url():
+    body = build_customer_receipt_body(
+        case_reference="WR-20260724-ABCDEF",
+        customer_email="buyer@example.com",
+        status_url="https://app.example.com/warranty/status",
+    )
+    assert "https://app.example.com/warranty/status" in body
+
+
+def test_maybe_send_customer_receipt_email_idempotent(monkeypatch):
+    sent = []
+
+    def fake_send(**kwargs):
+        sent.append(kwargs)
+        return True
+
+    monkeypatch.setattr("warranty_email.send_customer_receipt_email", fake_send)
+    ticket = FakeTicket()
+    ticket.status = "awaiting_admin_review"
+    ticket.set_collected("customer_contact_email", "buyer@example.com")
+    ticket.set_collected("case_reference", "WR-20260724-ABCDEF")
+
+    ok, reason = maybe_send_customer_receipt_email(ticket=ticket)
+    assert ok is True
+    assert reason is None
+    assert ticket.get_collected().get("receipt_email_sent") == "1"
+
+    ok2, reason2 = maybe_send_customer_receipt_email(ticket=ticket)
+    assert ok2 is False
+    assert reason2 == "already_sent"
+    assert len(sent) == 1
+
+
+def test_maybe_send_customer_receipt_force_allows_send_info(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        "warranty_email.send_customer_receipt_email",
+        lambda **kwargs: sent.append(kwargs) or True,
+    )
+    ticket = FakeTicket()
+    ticket.status = "send_info"
+    ticket.set_collected("customer_contact_email", "buyer@example.com")
+
+    ok, reason = maybe_send_customer_receipt_email(ticket=ticket)
+    assert ok is False
+    assert reason == "status_not_eligible"
+
+    ok2, reason2 = maybe_send_customer_receipt_email(ticket=ticket, force=True)
+    assert ok2 is True
+    assert reason2 is None
+    assert len(sent) == 1

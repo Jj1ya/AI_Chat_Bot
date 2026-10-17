@@ -9,11 +9,28 @@ load_dotenv(override=True)
 # ==========================================
 SUPPORT_BUSINESS_HOURS = "Mon-Fri, 9:30 AM - 6:30 PM / Sat, 10:00 AM - 4:00 PM CST"
 
-WARRANTY_PHONE = "+1-888-848-2630"
+SALES_PHONE = "+1-888-848-2630 ext. 2"
+WARRANTY_PHONE = "+1-888-848-2630 ext. 3"
+WARRANTY_BUSINESS_HOURS = "Mon-Fri, 10:00 AM - 6:00 PM CST"
+
+
+def department_phone_directory() -> str:
+    """Customer-facing Sales vs Warranty numbers on the shared main line."""
+    return (
+        f"**Sales (delivery & orders):** {SALES_PHONE}\n"
+        f"**Warranty (setup & defects):** {WARRANTY_PHONE}"
+    )
+
+
+# Shown on after-hours IVR when sales may still answer on weekends (configure per ops).
+SALES_BUSINESS_HOURS = os.environ.get(
+    "SALES_BUSINESS_HOURS",
+    "Sales may be available on Saturdays — warranty phone support is weekdays only.",
+)
 
 SALES_PHONE_BY_DOMAIN = {
     "osakiusa":          "+1-888-501-5988",
-    "titanchair":        "1-888-848-2630",
+    "titanchair":        "+1-888-848-2630 ext. 2",
     "osakimassagechair": "+1-214-613-1630",
 }
 
@@ -46,8 +63,42 @@ SUPPORT_CONTACT_MSG = f"If you need further assistance, please contact our suppo
 COMPANY_ADDRESS = "1001 W Crosby Rd, Carrollton, TX 75006"
 SHOWROOM_LOCATION = COMPANY_ADDRESS
 
+# Prior notice for chat recording/storage (Florida FSCA-style disclosure).
+CHAT_RECORDING_NOTICE = (
+    "By continuing this chat, you agree to our Privacy Policy and Terms of Service. "
+    "This conversation may be recorded, stored, and reviewed to provide support "
+    "and improve our service. "
+    "Messages, email addresses, and photos or videos you share may also be stored "
+    "for warranty support. "
+    f"If you do not agree, please close this chat and contact us by phone at {WARRANTY_PHONE} instead."
+)
 
-def get_contact_msg(routing: str, target_domain: str) -> str:
+CHAT_WELCOME_MESSAGE = (
+    "Hello! Welcome to Osaki & Titan support. 👋\n\n"
+    "Which massage chair model do you have? "
+    "You can find it on the serial-number sticker on your chair "
+    "(for example, OS-4000T, Solo Flex, or Hypnos 4D).\n\n"
+    "Tell me your model, or ask about specs, pricing, orders, delivery, warranty, "
+    "or troubleshooting.\n\n"
+    f"{department_phone_directory()}\n\n"
+    "---\n\n"
+    f"{CHAT_RECORDING_NOTICE}"
+)
+
+WARRANTY_WELCOME_MESSAGE = (
+    "Hello! Welcome to Osaki & Titan warranty support. 👋\n\n"
+    "First, which massage chair model do you have? "
+    "You can find it on the serial-number sticker on your chair "
+    "(for example, OS-4000T, Solo Flex, or Hypnos 4D).\n\n"
+    "Please type your model below. Once we confirm it, we'll guide you through "
+    "setup or a defect. For delivery and tracking, call sales.\n\n"
+    f"{department_phone_directory()}\n\n"
+    "---\n\n"
+    f"{CHAT_RECORDING_NOTICE}"
+)
+
+
+def get_contact_msg(routing: str, target_domain: str, language: str = "en") -> str:
     """Return the correct footer based on intent (Sales vs Warranty) and domain."""
     is_sales = "PRODUCTS" in routing.upper()
 
@@ -58,14 +109,40 @@ def get_contact_msg(routing: str, target_domain: str) -> str:
             if key in domain_lower:
                 phone = number
                 break
+        directory = department_phone_directory()
+        if language == "es":
+            return (
+                f"Para consultas de ventas, llame al {phone}. Horario: {SUPPORT_BUSINESS_HOURS}.\n"
+                f"{directory}"
+            )
+        if language == "ko":
+            return (
+                f"구매 상담은 {phone}으로 연락해 주세요. 운영 시간: {SUPPORT_BUSINESS_HOURS}.\n"
+                f"{directory}"
+            )
         return (
             f"For sales inquiries, please contact us at {phone}. "
-            f"Our business hours are {SUPPORT_BUSINESS_HOURS}."
+            f"Our business hours are {SUPPORT_BUSINESS_HOURS}.\n"
+            f"{directory}"
         )
 
+    directory = department_phone_directory()
+    if language == "es":
+        return (
+            f"Si necesita más ayuda, llame al equipo de garantía al {WARRANTY_PHONE}. "
+            f"Horario de garantía: {WARRANTY_BUSINESS_HOURS}.\n"
+            f"{directory}"
+        )
+    if language == "ko":
+        return (
+            f"추가 도움이 필요하면 보증팀 {WARRANTY_PHONE}으로 연락해 주세요. "
+            f"보증팀 운영 시간: {WARRANTY_BUSINESS_HOURS}.\n"
+            f"{directory}"
+        )
     return (
-        f"If you need further assistance, please contact our support team at {WARRANTY_PHONE}. "
-        f"Our business hours are {SUPPORT_BUSINESS_HOURS}."
+        f"If you need further assistance, please contact our warranty team at "
+        f"{WARRANTY_PHONE}. Our warranty hours are {WARRANTY_BUSINESS_HOURS}.\n"
+        f"{directory}"
     )
 
 # 프론트엔드에서 도메인을 넘겨주지 않았을 때 사용할 기본 폴백(Fallback) 도메인
@@ -80,9 +157,9 @@ REPAIR_MANUAL_URL = "https://www.otasupport.com"
 # ==========================================
 MAX_RETRIES = 3
 
-# LLM 모델 설정 (추후 gpt-5가 나오면 여기서만 수정하면 됨)
-AGENT_MODEL = "gpt-4o"
-ROUTER_MODEL = "gpt-4o-mini"
+# LLM model settings — override via env without code changes.
+AGENT_MODEL = os.environ.get("OPENAI_AGENT_MODEL", "gpt-5.6")
+ROUTER_MODEL = os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4.1-mini")
 
 # 💰 [Cost Optimization] Embedding model:
 # - text-embedding-3-small : 5x cheaper than ada-002 AND higher quality.
@@ -112,6 +189,10 @@ FAISS_SEARCH_K = 5 # 사용자 질문 시 Vector DB에서 가져올 최대 문�
 # changes prices. Cached input is billed at 50% of the regular input rate
 # (OpenAI prompt caching).
 MODEL_PRICING_USD_PER_1M = {
+    "gpt-5.6":            {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-sol":        {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-terra":      {"input": 2.50, "cached_input": 0.25, "output": 15.00},
+    "gpt-5.6-luna":       {"input": 1.00, "cached_input": 0.10, "output": 6.00},
     "gpt-4o":              {"input": 2.50, "cached_input": 1.25, "output": 10.00},
     "gpt-4o-mini":         {"input": 0.15, "cached_input": 0.075, "output": 0.60},
     "gpt-4.1":             {"input": 2.00, "cached_input": 0.50, "output": 8.00},
@@ -141,12 +222,24 @@ CHAT_CACHE_ENABLED = os.environ.get("CHAT_CACHE_ENABLED", "1") == "1"
 CHAT_CACHE_TTL_SECONDS = int(os.environ.get("CHAT_CACHE_TTL_SECONDS", 600))  # 10 min
 CHAT_CACHE_MAX_ENTRIES = int(os.environ.get("CHAT_CACHE_MAX_ENTRIES", 512))
 
+# Pre-LLM scope gate (blocks off-topic before the agent loop).
+SCOPE_CLASSIFIER_ENABLED = os.environ.get("SCOPE_CLASSIFIER_ENABLED", "1") == "1"
+SCOPE_CLASSIFIER_LLM = os.environ.get("SCOPE_CLASSIFIER_LLM", "1") == "1"
+
 
 # ==========================================
 # 6. CORS — restrict allowed origins in production
 # ==========================================
 # Comma-separated list, or "*" to allow all (dev only).
-CORS_ALLOWED_ORIGINS = os.environ.get(
-    "CORS_ALLOWED_ORIGINS",
-    "*",  # ⚠️ Tighten in production: https://titanchair.com,https://osakiusa.com,...
-).split(",")
+_DEFAULT_PRODUCTION_CORS = (
+    "https://www.osakiusa.com,https://osakiusa.com,"
+    "https://www.titanchair.com,https://titanchair.com,"
+    "https://www.osakimassagechair.com,https://osakimassagechair.com,"
+    "https://help.osakichair.com"
+)
+_cors_default = (
+    _DEFAULT_PRODUCTION_CORS
+    if os.environ.get("APP_ENV", "").strip().lower() == "production"
+    else "*"
+)
+CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", _cors_default).split(",")

@@ -1,0 +1,1498 @@
+"""
+tests/test_sales_router.py
+==========================
+HTTP-level tests for the Sales AI (Tidio) router.
+
+We cover the guardrail contract end-to-end plus a couple of happy-path
+turns. The in-memory SQLite fixture keeps every test isolated.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+APP_DIR = Path(__file__).resolve().parent.parent / "app"
+sys.path.insert(0, str(APP_DIR))
+
+import warranty_models as wm  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def in_memory_db(monkeypatch):
+    """Redirect the shared warranty engine at an in-memory SQLite instance."""
+    mem_engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    mem_session_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=mem_engine,
+        expire_on_commit=False,
+    )
+    wm.Base.metadata.create_all(bind=mem_engine)
+    monkeypatch.setattr(wm, "_engine", mem_engine)
+    monkeypatch.setattr(wm, "_SessionFactory", mem_session_factory)
+
+    import sales_router as sr  # noqa: WPS433
+
+    monkeypatch.setattr(sr, "_ADMIN_API_KEY", "test-admin-key")
+    yield
+
+
+@pytest.fixture
+def client():
+    from sales_router import router  # noqa: WPS433
+
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app)
+
+
+# ---------------------------------------------------------------------------
+# Guardrails (must never answer directly, always handoff=True)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message,expected_intent",
+    [
+        ("my chair won't power on", "warranty_redirect"),
+        ("I want to cancel my order", "cancel_refund"),
+        ("please refund my purchase", "cancel_refund"),
+        ("send a technician to my house", "parts_technician"),
+        ("when will it arrive?", "eta_shipping"),
+        ("where is my order", "order_status"),
+    ],
+)
+def test_guardrail_intents_return_handoff(client, message, expected_intent):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-guard", "message": message, "domain": "osakiusa.com"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["intent"] == expected_intent
+    assert body["handoff"] is True
+    assert body["handoff_reason"] == expected_intent
+    assert body["reply"], "handoff replies must not be empty"
+    if expected_intent in ("eta_shipping", "order_status", "warranty_redirect"):
+        assert "warranty" in body["reply"].lower()
+        assert "zip" not in body["reply"].lower()
+    if expected_intent == "discount":
+        assert "%" not in body["reply"]
+        assert "promo" not in body["reply"].lower()
+
+
+def test_answer_offers_a_rating_and_stores_it(client):
+    """An answer the shopper can rate, and a rating that actually persists."""
+    from sales_models import SalesFeedback
+    from warranty_models import warranty_db_session
+
+    sid = "s-csat"
+    answer = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "what is your return policy", "domain": "osakiusa.com"},
+    )
+    assert answer.status_code == 200, answer.text
+    payloads = [q["payload"] for q in answer.json()["quick_replies"]]
+    assert "feedback:up" in payloads and "feedback:down" in payloads
+
+    rated = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "", "payload": "feedback:down", "domain": "osakiusa.com"},
+    )
+    assert rated.status_code == 200, rated.text
+    assert rated.json()["intent"] == "feedback"
+
+    with warranty_db_session() as db:
+        rows = db.query(SalesFeedback).filter(SalesFeedback.session_id == sid).all()
+        assert len(rows) == 1
+        assert rows[0].rating == "not_helpful"
+        # The rating is attributed to the answer it was given for.
+        assert rows[0].intent == "prepurchase_policy"
+
+
+def test_clarifying_questions_are_not_rateable(client):
+    """Rating a "what's your height?" prompt would measure nothing."""
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-no-csat", "message": "recommend a chair", "domain": "osakiusa.com"},
+    )
+    payloads = [q["payload"] for q in resp.json()["quick_replies"]]
+    assert "feedback:up" not in payloads
+
+
+@pytest.mark.parametrize(
+    ("message", "must_contain"),
+    [
+        ("what is your return policy", "30 days"),
+        ("how long is the warranty", "three (3) years"),
+        ("how much is shipping", "up to 2 weeks"),
+        ("how long does shipping take", "up to 3 weeks"),
+        ("do you ship to Alaska", "you pay"),
+        ("can you deliver to Hawaii", "quote"),
+        ("do you ship to Guam", "don't ship"),
+        ("what's the difference between 3D and 4D", "in and out"),
+        ("do you offer financing", "Affirm"),
+    ],
+)
+def test_prepurchase_questions_are_answered_over_chat(client, message, must_contain):
+    """These used to send shoppers to the Warranty Department by mistake."""
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-policy", "message": message, "domain": "osakiusa.com"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["intent"] == "prepurchase_policy"
+    assert body["handoff"] is False
+    assert must_contain.lower() in body["reply"].lower()
+    assert "service@osakititan.com" not in body["reply"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Happy paths (deterministic — no LLM)
+# ---------------------------------------------------------------------------
+
+
+def test_greeting_returns_menu(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-g", "message": "hello"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "greeting"
+    assert body["handoff"] is False
+    labels = [q["label"] for q in body["quick_replies"]]
+    assert "Recommend a chair" in labels
+    assert "Talk to a human" in labels
+    assert labels[-1] == "Talk to a human"
+    assert labels[0] != "Talk to a human"
+
+
+def test_talk_to_a_human_offers_help_before_handoff(client):
+    first = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-human", "message": "talk to a human", "domain": "osakiusa.com"},
+    )
+    assert first.status_code == 200
+    body = first.json()
+    assert body["handoff"] is False
+    assert "one thing" in body["reply"].lower()
+    payloads = [q["payload"] for q in body["quick_replies"]]
+    assert "human:confirm" in payloads
+
+    second = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-human",
+            "message": "still connect me",
+            "payload": "human:confirm",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["handoff"] is True
+
+
+def test_talk_to_a_human_then_the_real_question_is_answered(client):
+    sid = "s-human-q"
+    client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "talk to a human", "domain": "osakiusa.com"},
+    )
+    answered = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "do you ship to Hawaii", "domain": "osakiusa.com"},
+    )
+    body = answered.json()
+    assert answered.status_code == 200
+    assert body["handoff"] is False
+    assert "you pay" in body["reply"].lower() or "freight" in body["reply"].lower()
+    assert any(q["payload"] == "human:confirm" for q in body["quick_replies"])
+
+
+def test_talk_to_a_human_replays_the_last_shopping_question(client):
+    sid = "s-human-replay"
+    asked = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "how long does shipping take", "domain": "osakiusa.com"},
+    )
+    assert asked.status_code == 200
+    assert "up to 2 weeks" in asked.json()["reply"].lower()
+
+    human = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "talk to a human", "domain": "osakiusa.com"},
+    )
+    assert human.status_code == 200
+    body = human.json()
+    assert body["handoff"] is False
+    assert "up to 2 weeks" in body["reply"].lower()
+    assert "still connect me" in body["reply"].lower()
+
+
+def test_discount_gets_published_facts_before_a_specialist(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-disc", "message": "any discount available?", "domain": "osakiusa.com"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["handoff"] is False
+    assert "%" not in body["reply"]
+    assert "can't quote" in body["reply"].lower() or "cannot quote" in body["reply"].lower()
+    assert "2 weeks" in body["reply"].lower()
+    assert any(q["payload"] == "human:confirm" for q in body["quick_replies"])
+
+
+def test_costco_price_gap_is_discount_not_recommend(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-costco",
+            "message": "Why is this chair $1000 more than on the Costco site",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "discount"
+    assert body["handoff"] is False
+    reply = body["reply"].lower()
+    assert "height" not in reply
+    assert "value / mid / premium" not in reply
+    assert "different" in reply and "model" in reply
+    assert "costco" not in reply
+    assert "amazon" not in reply
+    assert "walmart" not in reply
+    assert "%" not in body["reply"]
+    assert any(q["payload"] == "human:confirm" for q in body["quick_replies"])
+
+
+def test_unclear_returns_menu_not_a_guess(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-u", "message": "purple monkey dishwasher"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "unclear"
+    assert body["handoff"] is False
+    assert any(q["payload"] == "human" for q in body["quick_replies"])
+
+
+def test_recommend_without_hints_asks_height(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-r", "message": "can you recommend a chair"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "recommend"
+    assert body["handoff"] is False
+    assert "height" in body["reply"].lower()
+    assert "budget range" not in body["reply"].lower()
+    payloads = {q["payload"] for q in body["quick_replies"]}
+    assert any(p.startswith("recommend:height:") for p in payloads)
+
+
+def test_recommend_budget_payload_ignored_still_asks_height(client):
+    """Legacy budget payloads no longer gate the flow — still fit-first."""
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-budget-band",
+            "message": "",
+            "payload": "recommend:budget:6000",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "recommend"
+    assert "height" in body["reply"].lower()
+    payloads = {q["payload"] for q in body["quick_replies"]}
+    assert any(p.startswith("recommend:height:") for p in payloads)
+    assert not any(p.startswith("recommend:budget:") for p in payloads)
+
+
+def test_recommend_guided_flow_returns_tiered_picks(client):
+    sid = "s-case-flow"
+    body = None
+    for payload in (
+        "recommend:height:petite",
+        "recommend:weight:le180",
+        "recommend:space:none",
+        "recommend:goal:neck",
+    ):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakimassagechair.com",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+    assert body["intent"] == "recommend"
+    reply = body["reply"].lower()
+    assert "value" in reply
+    assert "mid-range" in reply or "mid" in reply
+    assert "premium" in reply
+    assert "titan pro cura" in reply or "osaki" in reply
+    assert "primary pick" not in reply
+    payloads = {q["payload"] for q in body["quick_replies"]}
+    assert not any(p.startswith("recommend:budget:") for p in payloads)
+
+
+def test_recommend_budget_after_fit_still_returns_tiers(client):
+    """Budget refine payloads are ignored — always Value/Mid/Premium list."""
+    sid = "s-budget-ignored"
+    body = None
+    for payload in (
+        "recommend:height:petite",
+        "recommend:weight:le180",
+        "recommend:space:none",
+        "recommend:goal:neck",
+        "recommend:budget:under_3000",
+    ):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakimassagechair.com",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+    reply = body["reply"].lower()
+    assert "value" in reply
+    assert "premium" in reply
+    assert "primary pick" not in reply
+
+
+def test_recommend_osakiusa_uses_titan_usa_book(client):
+    sid = "s-usa-titan-book"
+    body = None
+    for payload in (
+        "recommend:height:petite",
+        "recommend:weight:le180",
+        "recommend:space:none",
+        "recommend:goal:neck",
+    ):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakiusa.com",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+    assert "Titan eCabin" in body["reply"] or "value" in body["reply"].lower()
+    assert "Osaki OS-Champ" not in body["reply"]
+    assert "primary pick" not in body["reply"].lower()
+
+
+def test_recommend_demotes_oos_with_live_stock(client, monkeypatch):
+    """When primary is OOS and an alt is in stock, lead with the in-stock model."""
+
+    class _Snap:
+        def __init__(self, handle, in_stock):
+            self.handle = handle
+            self.title = handle
+            self.status = "active"
+            self.available_for_sale = in_stock
+            self.total_inventory = 5 if in_stock else 0
+            self.source = "shopify"
+
+        @property
+        def in_stock(self):
+            return self.available_for_sale and self.total_inventory > 0
+
+        @property
+        def is_low(self):
+            return False
+
+    def _fake_stock(handle, domain=None, title=None, timeout=8.0):
+        # Champ OOS; force alts in stock when resolved.
+        if "champ" in (handle or "").lower():
+            return _Snap(handle, False)
+        return _Snap(handle, True)
+
+    monkeypatch.setattr("sales_agent.fetch_live_stock", _fake_stock)
+    monkeypatch.setattr("sales_shopify_stock.fetch_live_stock", _fake_stock)
+
+    sid = "s-stock-demote"
+    body = None
+    for payload in (
+        "recommend:height:petite",
+        "recommend:weight:le180",
+        "recommend:space:none",
+        "recommend:goal:neck",
+    ):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakimassagechair.com",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+    assert body is not None
+    assert "in stock" in body["reply"].lower() or "out of stock" in body["reply"].lower()
+    assert "shopify.inventory" in body.get("tools_used", [])
+    payloads = {q["payload"] for q in body["quick_replies"]}
+    assert "lead:save_pick" in payloads
+    assert "products/" in body["reply"] or "https://" in body["reply"]
+    assert "value" in body["reply"].lower()
+    assert "https://" in body["reply"]
+    assert "Open these links" not in body["reply"]
+
+
+def test_email_me_this_pick_captures_lead_with_summary(client, monkeypatch):
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: None)
+    monkeypatch.setattr("sales_shopify_stock.fetch_live_stock", lambda *a, **k: None)
+
+    sid = "s-email-pick"
+    for payload in (
+        "recommend:height:petite",
+        "recommend:weight:le180",
+        "recommend:space:none",
+        "recommend:goal:neck",
+    ):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakiusa.com",
+            },
+        )
+        assert resp.status_code == 200
+
+    ask = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "", "payload": "lead:save_pick", "domain": "osakiusa.com"},
+    )
+    assert ask.status_code == 200
+    assert "email" in ask.json()["reply"].lower()
+
+    done = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "buyer@example.com",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert done.status_code == 200
+    body = done.json()
+    assert body["handoff"] is True
+    assert "confirmation email" in body["reply"].lower()
+    assert "buyer@example.com" in body["reply"]
+    assert "lead.capture" in body.get("tools_used", [])
+
+
+def test_deliver_lead_also_emails_the_shopper(monkeypatch):
+    import sales_leads
+
+    receipts: list[dict] = []
+    monkeypatch.setattr(
+        sales_leads, "_resolve_transport", lambda: lambda *a, **k: True
+    )
+    monkeypatch.setattr(sales_leads, "_mark_lead_status", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sales_leads, "_send_shopper_receipt", lambda **kwargs: receipts.append(kwargs)
+    )
+    sales_leads.deliver_lead(
+        lead_id=1,
+        domain="osakiusa.com",
+        email="buyer@example.com",
+        interest_summary="Osaki OS-Pro Maestro 4D",
+    )
+    assert receipts
+    assert receipts[0]["email"] == "buyer@example.com"
+    assert "Maestro" in (receipts[0]["interest_summary"] or "")
+
+
+def test_free_text_skips_secondary_questions(client, monkeypatch):
+    """Core fit + space in one message → recommend without asking intensity/foot."""
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: None)
+
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-skip-secondary",
+            "message": "I'm 6'2, 220 lb, lower back pain, no space issue, under $5k",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "recommend"
+    reply = body["reply"].lower()
+    assert "value" in reply
+    assert "premium" in reply
+    assert "primary pick" not in reply
+    assert "intensity" not in body["reply"].lower() or "defaults" in body["reply"].lower()
+    assert "preferred **massage intensity**" not in body["reply"].lower()
+    payloads = {q["payload"] for q in body["quick_replies"]}
+    assert "lead:save_pick" in payloads
+
+
+def test_height_and_goal_are_enough_to_recommend(client, monkeypatch):
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: None)
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-two-ask",
+            "message": "6'2, back pain, under $5k",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "recommend"
+    assert "value" in body["reply"].lower()
+    assert "weight range" not in body["reply"].lower()
+    assert "lead:save_pick" in {q["payload"] for q in body["quick_replies"]}
+
+
+def test_height_then_goal_buttons_recommend(client, monkeypatch):
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: None)
+    sid = "s-two-btn"
+    body = None
+    for payload in ("recommend:height:tall", "recommend:goal:lower_back"):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakiusa.com",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+    assert body is not None
+    assert "value" in body["reply"].lower()
+    assert "premium" in body["reply"].lower()
+    assert "assumed" in body["reply"].lower()
+
+
+def test_tiered_recommend_includes_product_links_when_in_stock(client, monkeypatch):
+    class _Snap:
+        def __init__(self, handle):
+            self.handle = handle
+            self.title = handle
+            self.status = "active"
+            self.available_for_sale = True
+            self.total_inventory = 8
+            self.source = "shopify"
+
+        @property
+        def in_stock(self):
+            return True
+
+        @property
+        def is_low(self):
+            return False
+
+    monkeypatch.setattr(
+        "sales_agent.fetch_live_stock",
+        lambda handle, domain=None, title=None, timeout=8.0: _Snap(handle or "x"),
+    )
+
+    sid = "s-convert"
+    body = None
+    for payload in (
+        "recommend:height:petite",
+        "recommend:weight:le180",
+        "recommend:space:none",
+        "recommend:goal:neck",
+    ):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakiusa.com",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+    assert body is not None
+    assert "value" in body["reply"].lower()
+    assert "https://" in body["reply"]
+    payloads = {q["payload"] for q in body["quick_replies"]}
+    assert "lead:save_pick" in payloads
+    assert "tier:1" in payloads
+    assert "compare:tiers:1:2" in payloads
+    assert "shopify.inventory" in body.get("tools_used", [])
+
+    opened = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "1", "domain": "osakiusa.com"},
+    )
+    assert opened.status_code == 200
+    follow = opened.json()["reply"].lower()
+    assert "why this pick" in follow
+    assert "shop" in follow or "https://" in follow
+
+    compared = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "compare:tiers:1:2",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert compared.status_code == 200
+    assert "mechanism" in compared.json()["reply"].lower()
+
+    showroom = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "cta:showroom",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert showroom.status_code == 200
+    assert "Carrollton" in showroom.json()["reply"]
+    assert "Hours" in showroom.json()["reply"] or "9:30" in showroom.json()["reply"]
+    show_payloads = [q["payload"] for q in showroom.json()["quick_replies"]]
+    assert "cta:showroom:book" in show_payloads
+    assert show_payloads[-1] == "human"
+
+
+def test_showroom_visit_request_emails_sales_without_locking_a_slot(client):
+    sid = "s-showroom-book"
+    info = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "where is your showroom",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert info.status_code == 200
+    assert "9:30" in info.json()["reply"]
+    assert "cta:showroom:book" in [q["payload"] for q in info.json()["quick_replies"]]
+
+    windows = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "cta:showroom:book",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert windows.status_code == 200
+    win_payloads = [q["payload"] for q in windows.json()["quick_replies"]]
+    assert "cta:showroom:window:saturday" in win_payloads
+    assert win_payloads[-1] == "human"
+    assert "not a locked appointment" in windows.json()["reply"].lower() or (
+        "not" in windows.json()["reply"].lower() and "confirm" in windows.json()["reply"].lower()
+    )
+
+    ask = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "cta:showroom:window:saturday",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert ask.status_code == 200
+    assert "email" in ask.json()["reply"].lower()
+    assert "not a booked appointment" in ask.json()["reply"].lower()
+
+    done = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "visitor@example.com",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert done.status_code == 200
+    body = done.json()
+    assert body["handoff"] is False
+    assert "visitor@example.com" in body["reply"]
+    assert "request" in body["reply"].lower()
+    assert "not" in body["reply"].lower() and "appointment" in body["reply"].lower()
+    assert "lead.capture" in body.get("tools_used", [])
+
+    from sales_models import SalesLead
+    from warranty_models import warranty_db_session
+
+    with warranty_db_session() as db:
+        rows = db.query(SalesLead).filter(SalesLead.session_id == sid).all()
+        assert len(rows) == 1
+        assert rows[0].reason == "showroom_visit"
+        assert rows[0].email == "visitor@example.com"
+        assert "not a confirmed appointment" in (rows[0].interest_summary or "").lower()
+
+
+def test_narrow_door_asks_doorway_inches(client):
+    sid = "s-door-inches"
+    body = None
+    for payload in (
+        "recommend:height:average",
+        "recommend:weight:le180",
+        "recommend:space:narrow_door",
+    ):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakiusa.com",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+    assert "doorway" in body["reply"].lower()
+    assert body.get("flow_stage") == "ask_doorway" or "inches" in body["reply"].lower()
+    payloads = {q["payload"] for q in body["quick_replies"]}
+    assert "recommend:doorway:30" in payloads
+
+    # Provide inches → ask assembled vs disassemble.
+    nxt = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "recommend:doorway:30",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert nxt.status_code == 200
+    nxt_body = nxt.json()
+    assert nxt_body.get("flow_stage") == "ask_doorway_fit" or "disassemble" in nxt_body[
+        "reply"
+    ].lower()
+    fit_payloads = {q["payload"] for q in nxt_body["quick_replies"]}
+    assert "recommend:doorway_fit:assembled" in fit_payloads
+
+    # Assembled-only → continue to goal.
+    goal = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "recommend:doorway_fit:assembled",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert goal.status_code == 200
+    assert (
+        "focus" in goal.json()["reply"].lower()
+        or "goal" in goal.json()["reply"].lower()
+        or "main focus" in goal.json()["reply"].lower()
+    )
+
+
+def test_golden_narrow_door_excludes_highpointe(client, monkeypatch):
+    """30\" assembled narrow path must not recommend Highpointe (36.5\")."""
+
+    class _Snap:
+        handle = "dummy"
+        title = "Dummy"
+        status = "active"
+        available_for_sale = True
+        total_inventory = 5
+        source = "shopify"
+        price_usd = 2499.0
+
+        @property
+        def in_stock(self):
+            return True
+
+        @property
+        def is_low(self):
+            return False
+
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: _Snap())
+
+    sid = "s-golden-narrow"
+    body = None
+    for payload in (
+        "recommend:height:average",
+        "recommend:weight:le180",
+        "recommend:space:narrow_door",
+        "recommend:doorway:30",
+        "recommend:doorway_fit:assembled",
+        "recommend:goal:neck",
+    ):
+        resp = client.post(
+            "/api/v1/sales/chat",
+            json={
+                "session_id": sid,
+                "message": "",
+                "payload": payload,
+                "domain": "osakiusa.com",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+    assert body is not None
+    assert body["intent"] == "recommend"
+    assert "Highpointe" not in body["reply"]
+
+
+def test_menu_button_payload_returns_menu(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-p", "message": "", "payload": "menu"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "greeting"
+
+
+def test_price_without_model_asks_for_it(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-price", "message": "how much is it?"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "price"
+    assert body["handoff"] is False
+    reply = body["reply"].lower()
+    assert "which model" in reply or "model name" in reply
+
+
+def test_named_price_uses_live_shopify_variant_range(client, monkeypatch):
+    class _Snap:
+        handle = "osaki-os-champ"
+        title = "Osaki OS-Champ"
+        status = "active"
+        available_for_sale = True
+        total_inventory = 5
+        source = "shopify"
+        price_usd = 1299.0
+        price_max_usd = 1499.0
+        in_stock = True
+        is_low = False
+
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: _Snap())
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-live-price",
+            "message": "How much is the Osaki OS-Champ?",
+            "domain": "osakiusa.com",
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "$1,299–$1,499 depending on options" in body["reply"]
+    assert "checked live on Shopify" in body["reply"]
+    assert body["products"][0]["price_usd"] == 1299.0
+    assert body["products"][0]["price_max_usd"] == 1499.0
+    assert "email me this pick" in body["reply"].lower()
+    assert any(q["payload"] == "lead:save_pick" for q in body["quick_replies"])
+    assert any(q["payload"].startswith("open:") for q in body["quick_replies"])
+
+
+def test_specs_include_authoritative_fit_dimensions(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-fit-specs",
+            "message": "Show me specs for Osaki OS-Champ",
+            "domain": "osakiusa.com",
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "Maximum user weight" in body["reply"]
+    assert "Doorway (assembled)" in body["reply"]
+    assert "Wall clearance" in body["reply"]
+    assert body["products"][0]["fit_specs"]["doorway_assembled_in"] is not None
+
+
+def test_tell_me_about_a_named_model_returns_its_specs(client):
+    """Regression: 'tell me about the Maestro' used to ask which model, even
+    though the fallback had already identified Maestro as a catalog token."""
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-tell-me",
+            "message": "tell me about the Maestro",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["intent"] == "specs"
+    assert "maestro" in body["reply"].lower()
+    assert "which model would you like specs for" not in body["reply"].lower()
+    # Bare "Maestro" is the 4D, not whichever Maestro variant is first in the index.
+    assert "maestro 4d" in body["reply"].lower()
+    assert "maestro le" not in body["reply"].lower()
+    assert body.get("products")
+    assert any(q["payload"] == "lead:save_pick" for q in body["quick_replies"])
+    assert "email me this pick" in body["reply"].lower()
+    assert "Heating:" not in body["reply"]
+    assert "Full quick specs" not in body["reply"]
+
+
+def test_chat_requires_message_or_payload(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-empty", "message": ""},
+    )
+    assert resp.status_code == 422
+
+
+def test_chat_rejects_unknown_storefront_domain(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-domain",
+            "message": "recommend a chair",
+            "domain": "example.invalid",
+        },
+    )
+    assert resp.status_code == 422
+    assert "storefront" in resp.json()["detail"].lower()
+
+
+def test_chat_normalizes_supported_storefront_domain(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-normal-domain",
+            "message": "hello",
+            "domain": "https://www.osakiusa.com/products/example",
+        },
+    )
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Session resume + admin dashboards
+# ---------------------------------------------------------------------------
+
+
+def test_session_resume_returns_messages(client):
+    client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-resume", "message": "hi"},
+    )
+    client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-resume", "message": "recommend a chair"},
+    )
+
+    resp = client.get("/api/v1/sales/session/s-resume")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session"]["session_id"] == "s-resume"
+    roles = [m["role"] for m in body["messages"]]
+    assert "user" in roles and "assistant" in roles
+
+
+def test_session_resume_404_for_unknown(client):
+    resp = client.get("/api/v1/sales/session/unknown")
+    assert resp.status_code == 404
+
+
+def test_admin_list_sessions_requires_key(client):
+    resp = client.get("/admin/sales/sessions")
+    assert resp.status_code in (401, 403)
+
+
+def test_admin_list_sessions_returns_row_after_chat(client):
+    client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": "s-admin", "message": "hello"},
+    )
+    resp = client.get(
+        "/admin/sales/sessions",
+        headers={"X-Admin-Key": "test-admin-key"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] >= 1
+    session_ids = [row["session_id"] for row in body["rows"]]
+    assert "s-admin" in session_ids
+
+
+# ---------------------------------------------------------------------------
+# Lead capture
+# ---------------------------------------------------------------------------
+
+
+def test_lead_requires_email_or_phone(client):
+    resp = client.post(
+        "/api/v1/sales/lead",
+        json={"session_id": "s-lead"},
+    )
+    assert resp.status_code == 422
+
+
+def test_lead_rejects_invalid_email(client):
+    resp = client.post(
+        "/api/v1/sales/lead",
+        json={"session_id": "s-lead", "email": "not-an-email"},
+    )
+    assert resp.status_code == 422
+
+
+def test_lead_captures_and_masks_email(client, monkeypatch):
+    import sales_leads
+
+    called = {}
+
+    def _fake_deliver(**kwargs):
+        called.update(kwargs)
+
+    monkeypatch.setattr(sales_leads, "deliver_lead", _fake_deliver)
+
+    resp = client.post(
+        "/api/v1/sales/lead",
+        json={
+            "session_id": "s-lead",
+            "email": "jane.doe@example.com",
+            "interest_summary": "Interested in OS-Pro Maestro LE",
+            "reason": "discount",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    # Public response never leaks a full email.
+    assert "@example.com" in body["email"]
+    assert body["email"] != "jane.doe@example.com"
+    # Sales must actually be notified, not just have the row stored.
+    assert called["email"] == "jane.doe@example.com"
+
+
+def test_phone_only_lead_still_notifies_sales(client, monkeypatch):
+    """A phone-only lead is as actionable as an email and must be forwarded."""
+    import sales_leads
+
+    called = {}
+    monkeypatch.setattr(
+        sales_leads, "deliver_lead", lambda **kwargs: called.update(kwargs)
+    )
+
+    resp = client.post(
+        "/api/v1/sales/lead",
+        json={
+            "session_id": "s-phone-lead",
+            "phone": "+1-555-0100",
+            "reason": "human",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert called["phone"] == "+1-555-0100"
+    assert not called["email"]
+
+
+def test_admin_leads_lists_captured_lead(client, monkeypatch):
+    import sales_leads
+
+    monkeypatch.setattr(sales_leads, "deliver_lead", lambda **_: None)
+
+    client.post(
+        "/api/v1/sales/lead",
+        json={
+            "session_id": "s-admin-lead",
+            "email": "hello@example.com",
+            "reason": "human",
+        },
+    )
+    resp = client.get(
+        "/admin/sales/leads",
+        headers={"X-Admin-Key": "test-admin-key"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] >= 1
+    reasons = [row["reason"] for row in body["rows"]]
+    assert "human" in reasons
+
+
+def test_admin_can_retry_failed_lead(client, monkeypatch):
+    import sales_leads
+    from sales_models import SalesLead
+    from warranty_models import warranty_db_session
+
+    with warranty_db_session() as db:
+        lead = SalesLead(
+            session_id="s-retry",
+            email="retry@example.com",
+            domain="osakiusa.com",
+            interest_summary="Retry me",
+            forwarded="failed",
+            forwarded_error="smtp",
+        )
+        db.add(lead)
+        db.flush()
+        lead_id = lead.id
+
+    called = {}
+    monkeypatch.setattr(
+        sales_leads, "deliver_lead", lambda **kwargs: called.update(kwargs)
+    )
+    response = client.post(
+        f"/admin/sales/leads/{lead_id}/retry",
+        headers={"X-Admin-Key": "test-admin-key"},
+    )
+    assert response.status_code == 200
+    assert called["lead_id"] == lead_id
+    with warranty_db_session() as db:
+        saved = db.query(SalesLead).filter_by(id=lead_id).one()
+        assert saved.forwarded == "pending"
+        assert saved.forwarded_error is None
+
+
+# ---------------------------------------------------------------------------
+# Mixed / real-world scenario
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_defect_and_price_still_routes_to_warranty(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-mix",
+            "message": "my chair is broken and how much is the OS-Pro Maestro?",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "warranty_redirect"
+    assert body["handoff"] is True
+
+
+def test_warranty_button_appears_when_relevant(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-w",
+            "message": "my chair delivered damaged",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "warranty" in body["reply"].lower()
+    labels = [q["label"].lower() for q in body["quick_replies"]]
+    assert any("email" in label or "menu" in label for label in labels)
+
+
+def _compare_handles():
+    from sales_compare import lookup_shop_models  # noqa: WPS433
+
+    maestro_4d = lookup_shop_models("Maestro 4D").unique
+    paragon = lookup_shop_models("Paragon").unique
+    if maestro_4d is None or paragon is None:
+        pytest.skip("Maestro 4D / Paragon missing from the Shopify export")
+    return maestro_4d, paragon
+
+
+def test_compare_asks_which_maestro_instead_of_guessing(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-compare-family",
+            "message": "compare Maestro vs Paragon",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    reply = body["reply"].lower()
+    assert "which" in reply and "maestro" in reply
+    assert "won't guess" in reply or "will not guess" in reply or "don't guess" in reply
+    payloads = [q["payload"] for q in body["quick_replies"]]
+    assert any(p.startswith("compare:pick:") for p in payloads)
+    assert payloads[-1] == "human"
+    assert "jupiter" not in reply
+
+
+def test_compare_short_names_and_missing_jupiter(client):
+    maestro_4d, paragon = _compare_handles()
+    sid = "s-compare-short"
+    compared = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "Maestro 4D vs Paragon",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert compared.status_code == 200
+    body = compared.json()
+    reply = body["reply"]
+    assert maestro_4d.display_name in reply
+    assert paragon.display_name in reply
+    assert "mechanism" in reply.lower()
+    payloads = [q["payload"] for q in body["quick_replies"]]
+    assert "compare:recommend" in payloads
+    assert payloads[-1] == "human"
+    assert "jupiter" not in reply.lower()
+
+    missing = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-compare-jupiter",
+            "message": "Maestro 4D vs Jupiter",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert missing.status_code == 200
+    miss_reply = missing.json()["reply"].lower()
+    assert "not on the current store catalog" in miss_reply
+    assert maestro_4d.display_name.lower() in miss_reply
+
+
+def test_compare_and_then_recommend_stays_inside_the_pair(client):
+    maestro_4d, paragon = _compare_handles()
+    sid = "s-compare-pick"
+    first = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "Maestro 4D and Paragon",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert first.status_code == 200
+    assert "compare:recommend" in {
+        q["payload"] for q in first.json()["quick_replies"]
+    }
+
+    asked = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "compare:recommend",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert asked.status_code == 200
+    ask_reply = asked.json()["reply"].lower()
+    assert "height" in ask_reply
+    assert maestro_4d.display_name.lower() in ask_reply
+    assert paragon.display_name.lower() in ask_reply
+    assert "value / mid / premium" not in ask_reply
+
+    client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "recommend:height:average",
+            "domain": "osakiusa.com",
+        },
+    )
+    picked = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": sid,
+            "message": "",
+            "payload": "recommend:goal:neck",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert picked.status_code == 200
+    pick_reply = picked.json()["reply"].lower()
+    assert (
+        "published fit" in pick_reply
+        or "too close" in pick_reply
+    )
+    assert "value (under" not in pick_reply
+    assert maestro_4d.display_name.lower() in pick_reply or paragon.display_name.lower() in pick_reply
+
+
+def test_compare_prompt_does_not_use_jupiter(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-compare-prompt",
+            "message": "compare two models",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    assert "jupiter" not in resp.json()["reply"].lower()
+
+
+def test_compare_family_vs_jupiter_says_missing_first(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-compare-family-jupiter",
+            "message": "Maestro vs Jupiter",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    reply = resp.json()["reply"].lower()
+    assert "not on the current store catalog" in reply
+    assert "jupiter" in reply
+    assert "which" in reply and "maestro" in reply
+    assert "dont know" not in reply
+
+
+def test_compare_hides_unpublished_foot_roller_junk(client, monkeypatch):
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: None)
+    maestro_4d, paragon = _compare_handles()
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-compare-junk",
+            "message": f"{maestro_4d.display_name} vs {paragon.display_name}",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    assert "dont know" not in resp.json()["reply"].lower()
+    assert "don't know" not in resp.json()["reply"].lower()
+
+
+def test_tall_guy_asks_height_instead_of_guessing(client, monkeypatch):
+    monkeypatch.setenv("SALES_INTENT_LLM", "0")
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: None)
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-tall-ask",
+            "message": "tall guy with back pain",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "recommend"
+    reply = body["reply"].lower()
+    assert "height" in reply
+    assert "6'3" not in reply and '6\'3"' not in body["reply"]
+    assert "extra tall" not in reply
+
+
+def test_color_named_model_does_not_dump_menu(client, monkeypatch):
+    monkeypatch.setenv("SALES_INTENT_LLM", "0")
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: None)
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-color",
+            "message": "Grande XL in black",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    reply = body["reply"].lower()
+    assert body["intent"] != "unclear"
+    assert "checkout" in reply
+    assert "grande" in reply or "xl" in reply
+
+
+def test_recommend_keeps_wait_when_they_ask_black(client, monkeypatch):
+    monkeypatch.setenv("SALES_INTENT_LLM", "0")
+    monkeypatch.setattr("sales_agent.fetch_live_stock", lambda *a, **k: None)
+    sid = "s-rec-black"
+    first = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "recommend a chair", "domain": "osakiusa.com"},
+    )
+    assert first.status_code == 200
+    assert "height" in first.json()["reply"].lower()
+    second = client.post(
+        "/api/v1/sales/chat",
+        json={"session_id": sid, "message": "do you have black", "domain": "osakiusa.com"},
+    )
+    assert second.status_code == 200
+    body = second.json()
+    reply = body["reply"].lower()
+    assert body["intent"] != "unclear"
+    assert "checkout" in reply
+    assert "height" in reply
+
+
+def test_sunday_and_doorway_are_not_unclear(client, monkeypatch):
+    monkeypatch.setenv("SALES_INTENT_LLM", "0")
+    sunday = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-sunday",
+            "message": "are you open Sunday",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert sunday.status_code == 200
+    sun = sunday.json()
+    assert sun["intent"] == "prepurchase_policy"
+    assert "Sunday isn't listed" in sun["reply"]
+
+    door = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-door",
+            "message": "30 inch door",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert door.status_code == 200
+    assert door.json()["intent"] != "unclear"
+    assert "door" in door.json()["reply"].lower() or "height" in door.json()["reply"].lower()
+
+
+def test_refurbished_is_an_honest_no(client):
+    resp = client.post(
+        "/api/v1/sales/chat",
+        json={
+            "session_id": "s-refurb",
+            "message": "do you sell refurbished chairs",
+            "domain": "osakiusa.com",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["intent"] == "prepurchase_policy"
+    assert body["handoff"] is False
+    assert "new" in body["reply"].lower()

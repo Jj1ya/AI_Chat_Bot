@@ -3,6 +3,7 @@
 import Link from "next/link";
 import type { AdminWarrantyTicket } from "@/lib/adminTypes";
 import AdminStatusBadge from "./AdminStatusBadge";
+import AdminChannelBadge from "./AdminChannelBadge";
 
 interface Props {
   tickets: AdminWarrantyTicket[];
@@ -38,7 +39,7 @@ export default function AdminTicketQueue({ tickets }: Props) {
       <table className="min-w-full divide-y divide-gray-200 text-sm">
         <thead className="bg-gray-50">
           <tr>
-            {["Ticket ID", "Status", "Issue / Defect", "Model", "Node", "Created", "Updated"].map(
+            {["Channel", "Ticket ID", "Status", "Contact", "Issue / Defect", "Model", "Node", "Created", "Updated"].map(
               (h) => (
                 <th
                   key={h}
@@ -57,6 +58,9 @@ export default function AdminTicketQueue({ tickets }: Props) {
               className="group cursor-pointer transition hover:bg-indigo-50"
             >
               <td className="px-4 py-3">
+                <AdminChannelBadge channel={t.channel} />
+              </td>
+              <td className="px-4 py-3">
                 <Link
                   href={`/admin/warranty/${t.ticket_id}`}
                   className="font-mono text-xs text-indigo-600 underline-offset-2 hover:underline"
@@ -66,6 +70,27 @@ export default function AdminTicketQueue({ tickets }: Props) {
               </td>
               <td className="px-4 py-3">
                 <AdminStatusBadge status={t.status} />
+              </td>
+              <td className="px-4 py-3 text-gray-700">
+                {t.caller_phone ? (
+                  <a href={`tel:${t.caller_phone}`} className="font-mono text-xs text-sky-700 underline-offset-2 hover:underline">
+                    {t.caller_phone}
+                  </a>
+                ) : t.customer_email ? (
+                  <a
+                    href={`mailto:${t.customer_email}`}
+                    className="text-indigo-600 underline-offset-2 hover:underline"
+                  >
+                    {t.customer_email}
+                  </a>
+                ) : t.intake_email_gate_status === "skipped" ||
+                  t.collected_data?.intake_email_gate_status === "skipped" ? (
+                  <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800">
+                    Skipped
+                  </span>
+                ) : (
+                  <span className="text-gray-400">—</span>
+                )}
               </td>
               <td className="px-4 py-3 text-gray-700">
                 {t.issue_type || "—"}

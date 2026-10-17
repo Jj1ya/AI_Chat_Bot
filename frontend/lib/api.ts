@@ -11,12 +11,17 @@ import type {
   ChatRequest,
   EvidenceType,
   EvidenceUploadResponse,
+  TroubleshootingOutcome,
   WarrantySessionResponse,
+  WarrantyContactResponse,
+  WarrantyStatusLookupResponse,
 } from "./types";
 
 // ---------------------------------------------------------------------------
 // Base URL
 // ---------------------------------------------------------------------------
+
+const DEFAULT_WARRANTY_DOMAIN = "osakiusa.com";
 
 /**
  * Resolve the backend base URL from the environment variable.
@@ -115,6 +120,134 @@ export async function getWarrantySession(
 }
 
 /**
+ * Record live-chat privacy / recording consent (I Agree tap).
+ *
+ * CONTRACT: POST /api/v1/warranty/session/{session_id}/consent
+ */
+export async function recordWarrantyChatConsent(
+  sessionId: string,
+  domain: string,
+  policyStore: string
+): Promise<{ consent_recorded: boolean; accepted_at: string }> {
+  const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(sessionId)}/consent`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ domain, policy_store: policyStore }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{ consent_recorded: boolean; accepted_at: string }>;
+}
+
+/**
+ * Soft-required contact email after I Agree (before chat starts).
+ *
+ * CONTRACT: POST /api/v1/warranty/session/{session_id}/contact-email
+ */
+export async function recordWarrantySessionContactEmail(
+  sessionId: string,
+  options: { customerEmail?: string; skipped?: boolean }
+): Promise<{
+  recorded: boolean;
+  customer_email?: string | null;
+  email_gate_status: string;
+  skipped: boolean;
+}> {
+  const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(
+    sessionId
+  )}/contact-email`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      customer_email: options.customerEmail || "",
+      skipped: Boolean(options.skipped),
+    }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+/**
+ * Register chair model — required before issue-type selection.
+ *
+ * CONTRACT: POST /api/v1/warranty/session/{session_id}/register-model
+ */
+export async function registerWarrantyModel(
+  sessionId: string,
+  model: string,
+  domain = DEFAULT_WARRANTY_DOMAIN
+): Promise<WarrantySessionResponse> {
+  const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(sessionId)}/register-model`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, domain }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<WarrantySessionResponse>;
+}
+
+/**
+ * Confirm or correct inferred model after smart-start.
+ *
+ * CONTRACT: POST /api/v1/warranty/session/{session_id}/confirm-model
+ */
+export async function confirmWarrantyModel(
+  sessionId: string,
+  payload: { confirmed?: boolean; model?: string; domain?: string }
+): Promise<WarrantySessionResponse> {
+  const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(sessionId)}/confirm-model`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      confirmed: payload.confirmed ?? true,
+      model: payload.model,
+      domain: payload.domain ?? DEFAULT_WARRANTY_DOMAIN,
+    }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<WarrantySessionResponse>;
+}
+
+/**
  * Start warranty intake at Installation / Delivery / Defect — no LLM call.
  *
  * CONTRACT: POST /api/v1/warranty/session/{session_id}/quick-start
@@ -122,7 +255,7 @@ export async function getWarrantySession(
 export async function quickStartWarranty(
   sessionId: string,
   issueType: "installation" | "delivery" | "defect",
-  domain = "osaki.com"
+  domain = DEFAULT_WARRANTY_DOMAIN
 ): Promise<WarrantySessionResponse> {
   const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(sessionId)}/quick-start`;
   const res = await fetch(url, {
@@ -144,7 +277,99 @@ export async function quickStartWarranty(
 }
 
 /**
- * Advance the warranty workflow by one step — no LLM call.
+ * Start warranty intake from natural language — server maps to issue type.
+ *
+ * CONTRACT: POST /api/v1/warranty/session/{session_id}/natural-start
+ */
+export async function naturalStartWarranty(
+  sessionId: string,
+  message: string,
+  domain = DEFAULT_WARRANTY_DOMAIN
+): Promise<WarrantySessionResponse> {
+  const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(sessionId)}/natural-start`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, domain }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<WarrantySessionResponse>;
+}
+
+/**
+ * Smart-start: free-text intake that fast-forwards multiple flowchart steps
+ * when the LLM is confident. Returns the same session payload as the other
+ * warranty endpoints plus a `smart_start` metadata block.
+ *
+ * CONTRACT: POST /api/v1/warranty/session/{session_id}/smart-start
+ */
+export async function smartStartWarranty(
+  sessionId: string,
+  message: string,
+  domain = DEFAULT_WARRANTY_DOMAIN
+): Promise<WarrantySessionResponse> {
+  const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(sessionId)}/smart-start`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, domain }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<WarrantySessionResponse>;
+}
+
+/**
+ * Abandon any in-progress warranty ticket so the customer can start over.
+ *
+ * Returns a session response with `ticket: null` (and `restarted: true`).
+ * The caller should also rotate the local `warranty_session_id` so any
+ * resolved/abandoned tickets stay out of the way of the new conversation.
+ *
+ * CONTRACT: POST /api/v1/warranty/session/{session_id}/restart
+ */
+export async function restartWarrantySession(
+  sessionId: string,
+  domain = DEFAULT_WARRANTY_DOMAIN
+): Promise<WarrantySessionResponse & { restarted?: boolean; closed_ticket_count?: number }> {
+  const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(sessionId)}/restart`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ domain }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+/**
+ * Advance the warranty workflow by one step — NLP maps free text when needed.
  *
  * CONTRACT: POST /api/v1/warranty/{ticket_id}/answer
  */
@@ -157,6 +382,32 @@ export async function submitWarrantyAnswer(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ answer }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<WarrantySessionResponse>;
+}
+
+/**
+ * Undo the last warranty workflow answer (one step back).
+ *
+ * CONTRACT: POST /api/v1/warranty/{ticket_id}/back
+ */
+export async function goBackWarranty(
+  ticketId: string
+): Promise<WarrantySessionResponse> {
+  const url = `${getApiBase()}/api/v1/warranty/${encodeURIComponent(ticketId)}/back`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
   });
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
@@ -205,6 +456,317 @@ export async function notifyWarrantyEmail(
 // ---------------------------------------------------------------------------
 
 /**
+ * Final-step contact — email only (N/A for photo/video).
+ *
+ * CONTRACT: POST /api/v1/warranty/{ticket_id}/contact
+ */
+/**
+ * Look up a submitted warranty case with the shareable WR- reference + email.
+ *
+ * CONTRACT: POST /api/v1/warranty/status
+ */
+export async function lookupWarrantyCaseStatus(
+  caseReference: string,
+  email: string
+): Promise<WarrantyStatusLookupResponse> {
+  const url = `${getApiBase()}/api/v1/warranty/status`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      case_reference: caseReference,
+      email,
+    }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<WarrantyStatusLookupResponse>;
+}
+
+export async function submitWarrantyContact(
+  ticketId: string,
+  customerEmail: string
+): Promise<WarrantyContactResponse> {
+  const url = `${getApiBase()}/api/v1/warranty/${encodeURIComponent(ticketId)}/contact`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ customer_email: customerEmail, evidence_na: true }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<WarrantyContactResponse>;
+}
+
+/**
+ * Send a "save & continue later" email link for the current warranty session.
+ *
+ * CONTRACT: POST /api/v1/warranty/session/{session_id}/resume-link
+ */
+export async function sendWarrantyResumeLink(
+  sessionId: string,
+  customerEmail: string
+): Promise<{ sent: boolean; customer_email: string; expires_in_days: number }> {
+  const url = `${getApiBase()}/api/v1/warranty/session/${encodeURIComponent(
+    sessionId
+  )}/resume-link`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ customer_email: customerEmail }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{
+    sent: boolean;
+    customer_email: string;
+    expires_in_days: number;
+  }>;
+}
+
+/**
+ * Exchange a signed resume token for the underlying session/ticket mapping.
+ *
+ * CONTRACT: GET /api/v1/warranty/resume/{token}
+ */
+export async function resumeWarrantyFromToken(token: string): Promise<{
+  ticket_id: string;
+  session_id: string;
+  status: string;
+  domain?: string;
+  expires_at: number;
+}> {
+  const url = `${getApiBase()}/api/v1/warranty/resume/${encodeURIComponent(token)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{
+    ticket_id: string;
+    session_id: string;
+    status: string;
+    domain?: string;
+    expires_at: number;
+  }>;
+}
+
+/**
+ * Submit thumbs-up / thumbs-down feedback for an assistant message.
+ *
+ * CONTRACT: POST /api/v1/feedback
+ * Body: { session_id, rating: "up"|"down", message_content, comment?, context?, ticket_id? }
+ */
+export interface ChatFeedbackPayload {
+  sessionId: string;
+  rating: "up" | "down";
+  messageContent: string;
+  comment?: string;
+  context?: "warranty" | "chat";
+  domain?: string;
+  ticketId?: string;
+}
+
+export async function submitChatFeedback(
+  payload: ChatFeedbackPayload
+): Promise<{ ok: boolean; feedback_id: number; rating: "up" | "down" }> {
+  const url = `${getApiBase()}/api/v1/feedback`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      session_id: payload.sessionId,
+      rating: payload.rating,
+      message_content: payload.messageContent,
+      comment: payload.comment,
+      context: payload.context ?? "warranty",
+      domain: payload.domain,
+      ticket_id: payload.ticketId,
+    }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{
+    ok: boolean;
+    feedback_id: number;
+    rating: "up" | "down";
+  }>;
+}
+
+/**
+ * Append a customer follow-up note after the warranty workflow ends.
+ *
+ * CONTRACT: POST /api/v1/warranty/{ticket_id}/customer-note
+ * Body: { note: string }  → { customer_notes: {text, created_at}[] }
+ *
+ * Used when the customer hides the contact form and types extra context
+ * into the chat input during the terminal step.
+ */
+export interface CustomerNoteEntry {
+  text: string;
+  created_at: string;
+}
+
+export async function submitCustomerNote(
+  ticketId: string,
+  note: string
+): Promise<{ ticket_id: string; customer_notes: CustomerNoteEntry[] }> {
+  const url = `${getApiBase()}/api/v1/warranty/${encodeURIComponent(ticketId)}/customer-note`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{
+    ticket_id: string;
+    customer_notes: CustomerNoteEntry[];
+  }>;
+}
+
+/** Persist progress through the resolution-first troubleshooting gate. */
+export async function submitTroubleshootingOutcome(
+  ticketId: string,
+  outcome: TroubleshootingOutcome | string
+): Promise<{
+  ticket_id: string;
+  outcome: TroubleshootingOutcome;
+  status: string;
+  self_service_resolved: boolean;
+}> {
+  const url = `${getApiBase()}/api/v1/warranty/${encodeURIComponent(ticketId)}/troubleshooting-outcome`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ outcome }),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+/** Return from the final email form to the preceding troubleshooting step. */
+export async function goBackFromWarrantyContact(
+  ticketId: string
+): Promise<{
+  ticket_id: string;
+  stage: "review" | "outcome";
+  outcome: "steps_completed" | null;
+}> {
+  const url = `${getApiBase()}/api/v1/warranty/${encodeURIComponent(ticketId)}/troubleshooting-back`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Serial-label OCR
+// ---------------------------------------------------------------------------
+
+export interface SerialOcrResponse {
+  model_name: string | null;
+  serial_number: string | null;
+  raw_text: string;
+  confidence: "high" | "medium" | "low";
+}
+
+/**
+ * Send a photo of the warranty sticker on the chair to the backend so it can
+ * auto-detect the chair model + serial number.
+ *
+ * CONTRACT: POST /api/v1/warranty/ocr/serial (multipart/form-data)
+ *   file: image/*  (≤ 8 MB)
+ *
+ * The backend never persists the uploaded photo — it just returns the
+ * extracted fields. The caller is responsible for showing them back to the
+ * customer for confirmation before starting a warranty intake.
+ */
+export async function extractSerialFromPhoto(file: File): Promise<SerialOcrResponse> {
+  const url = `${getApiBase()}/api/v1/warranty/ocr/serial`;
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(url, { method: "POST", body: formData });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      detail = err.detail ?? detail;
+    } catch {
+      // ignore
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<SerialOcrResponse>;
+}
+
+/**
  * Upload an evidence file for a warranty ticket.
  *
  * CONTRACT: POST /api/v1/warranty/{ticket_id}/evidence (multipart/form-data)
@@ -218,7 +780,7 @@ export async function notifyWarrantyEmail(
  */
 export async function uploadEvidence(
   ticketId: string,
-  evidenceType: EvidenceType,
+  evidenceType: string,
   file: File,
   customerEmail: string
 ): Promise<EvidenceUploadResponse> {
@@ -246,13 +808,5 @@ export async function uploadEvidence(
     throw new Error(detail);
   }
 
-  const data = (await res.json()) as EvidenceUploadResponse & {
-    saved_path?: string;
-  };
-
-  // Strip internal server path before returning to UI
-  // TODO(contract-gap): Ideally the backend should not return saved_path at all
-  //   in the customer-facing response. Tracked in docs/warranty_api_contract.md.
-  const { saved_path: _stripped, ...safe } = data;
-  return safe;
+  return (await res.json()) as EvidenceUploadResponse;
 }

@@ -294,6 +294,25 @@ if "session_id" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+CHAT_WELCOME_MESSAGE = (
+    "Hello! Welcome to Osaki & Titan support. 👋\n\n"
+    "Which massage chair model do you have? "
+    "You can find it on the serial-number sticker on your chair "
+    "(for example, OS-4000T, Solo Flex, or Hypnos 4D).\n\n"
+    "Tell me your model, or ask about specs, pricing, orders, delivery, warranty, "
+    "or troubleshooting.\n\n"
+    "---\n\n"
+    "By continuing this chat, you agree to our Privacy Policy and Terms of Service. "
+    "This conversation may be recorded, stored, and reviewed to provide support "
+    "and improve our service. "
+    "Messages, email addresses, and photos or videos you share may also be stored "
+    "for warranty support. "
+    "If you do not agree, please close this chat and contact us by phone at +1-888-848-2630 ext. 3 instead."
+)
+
+if not st.session_state.messages:
+    st.session_state.messages = [{"role": "assistant", "content": CHAT_WELCOME_MESSAGE}]
+
 # 4. 사이드바 UI 구성
 with st.sidebar:
     st.image(current_brand["logo"], width=150)

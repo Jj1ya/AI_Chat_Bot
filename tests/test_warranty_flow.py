@@ -97,7 +97,21 @@ def walk(ticket_id: str, answers: list[str]) -> dict:
     """Submit a sequence of answers and return the last SubmitResult."""
     result: dict = {}
     for ans in answers:
-        result = WarrantyEngine.submit_answer(ticket_id, ans)
+        result = submit(ticket_id, ans)
+    return result
+
+
+def submit(ticket_id: str, answer: str) -> dict:
+    """Submit one answer; auto-dismiss error-code gate when tests expect the terminal."""
+    import warranty_error_code_gate as gate
+
+    result = WarrantyEngine.submit_answer(ticket_id, answer)
+    while result.get("next_node_id") in (
+        gate.GATE_VISIBLE_ID,
+        gate.GATE_PICK_ID,
+        gate.GATE_ENTER_ID,
+    ):
+        result = WarrantyEngine.submit_answer(ticket_id, "error_code_no")
     return result
 
 
@@ -126,7 +140,8 @@ def test_installation_model_to_send_info():
     result = walk(ticket_id, [
         "warranty",        # root → issue_type
         "installation",    # issue_type → install_model
-        "OS-4000T",        # install_model (question_text) → install_send_video
+        "OS-4000T",        # install_model → install_concern
+        "general_setup",   # install_concern → install_send_video
     ])
 
     assert result["next_node_id"] == "install_send_video"
@@ -138,26 +153,133 @@ def test_installation_model_to_send_info():
     assert str(t.status) == "send_info"  # DIY: send video — no admin needed
 
     turns = WarrantyEngine.get_turns(ticket_id)
-    assert len(turns) == 3
+    assert len(turns) == 4
     assert str(turns[2].customer_answer) == "OS-4000T"
     assert str(turns[2].answer_key) == "model_name"
+
+
+def test_advance_to_issue_type_defect():
+    """Phone IVR skips root/issue_type and lands on defect_problem_type."""
+    ticket_id, root = start("phone-defect", "phone")
+    assert root["node_id"] == "root"
+
+    result = WarrantyEngine.advance_to_issue_type(ticket_id, "defect")
+    assert result["next_node_id"] == "defect_problem_type"
+    assert result["next_node"]["type"] == "question"
+
+    t = ticket(ticket_id)
+    assert str(t.issue_type) == "defect"
+    turns = WarrantyEngine.get_turns(ticket_id)
+    assert len(turns) == 2
+    assert str(turns[0].answer_key) == "warranty"
+    assert str(turns[1].answer_key) == "defect"
+
+
+def test_installation_footrest_air_to_diy_terminal():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "installation",
+        "Osaki 4D Maestro LE 2.0",
+        "footrest_or_no_air",
+    ])
+
+    assert result["next_node_id"] == "install_air_hose_terminal"
+    assert result["is_terminal"] is True
+    assert str(ticket(ticket_id).status) == "send_info"
+
+
+def test_defect_voice_not_working_to_diy_terminal():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "defect",
+        "voice",
+        "voice_no_response",
+    ])
+
+    assert result["next_node_id"] == "defect_voice_not_working_terminal"
+    assert result["is_terminal"] is True
+    assert str(ticket(ticket_id).status) == "send_info"
+    assert str(ticket(ticket_id).defect_type) == "voice"
+
+
+def test_defect_voice_false_triggers_to_diy_terminal():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "defect",
+        "voice",
+        "false_triggers",
+    ])
+
+    assert result["next_node_id"] == "defect_voice_false_triggers_terminal"
+    assert result["is_terminal"] is True
+
+
+def test_defect_heating_not_heating_to_diy_terminal():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "defect",
+        "heat",
+        "not_heating",
+        "still_no_heat",
+    ])
+
+    assert result["next_node_id"] == "defect_heating_not_heating_terminal"
+    assert result["is_terminal"] is True
+    assert str(ticket(ticket_id).defect_type) == "heat"
+
+
+def test_defect_heating_intermittent_to_diy_terminal():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "defect",
+        "heat",
+        "intermittent",
+    ])
+
+    assert result["next_node_id"] == "defect_heating_intermittent_terminal"
+    assert result["is_terminal"] is True
+
+
+def test_defect_heating_too_hot_to_diy_terminal():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "defect",
+        "heat",
+        "too_hot",
+    ])
+
+    assert result["next_node_id"] == "defect_heating_too_hot_terminal"
+    assert result["is_terminal"] is True
 
 
 # ---------------------------------------------------------------------------
 # Scenario 2 — Delivery, no tracking → lookup by name → awaiting_admin
 # ---------------------------------------------------------------------------
 
-def test_delivery_no_tracking_continues_to_damage_question():
+def test_delivery_no_tracking_continues_to_problem_type():
     ticket_id, _ = start()
 
     result = walk(ticket_id, [
         "warranty",        # root → issue_type
-        "delivery",        # issue_type → delivery_tracking_q
+        "delivery",        # issue_type → delivery_intent_q
+        "damage_issue",    # delivery_intent_q → delivery_tracking_q
         "no_tracking",     # delivery_tracking_q → delivery_get_name
-        "customer@example.com",  # delivery_get_name → delivery_visible_damage_q
+        "customer@example.com",  # delivery_get_name → delivery_problem_type_q
     ])
 
-    assert result["next_node_id"] == "delivery_visible_damage_q"
+    assert result["next_node_id"] == "delivery_problem_type_q"
     assert result["is_terminal"] is False
 
     t = ticket(ticket_id)
@@ -165,7 +287,25 @@ def test_delivery_no_tracking_continues_to_damage_question():
     assert t.get_collected().get("order_or_email") == "customer@example.com"
 
     turns = WarrantyEngine.get_turns(ticket_id)
-    assert len(turns) == 4
+    assert len(turns) == 5
+
+
+def test_delivery_status_check_ends_at_status_terminal():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "delivery",
+        "status_check",
+        "no_tracking",
+        "customer@example.com",
+    ])
+
+    assert result["next_node_id"] == "delivery_status_terminal"
+    assert result["is_terminal"] is True
+    t = ticket(ticket_id)
+    assert str(t.status) == "awaiting_admin_review"
+    assert t.get_collected().get("order_or_email") == "customer@example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +317,11 @@ def test_delivery_tracking_box_damage_signed_cleared():
 
     result = walk(ticket_id, [
         "warranty",           # root → issue_type
-        "delivery",           # issue_type → delivery_tracking_q
+        "delivery",           # issue_type → delivery_intent_q
+        "damage_issue",       # → delivery_tracking_q
         "has_tracking",       # delivery_tracking_q → delivery_get_tracking_number
-        "1Z999AA10123456784", # tracking number → delivery_visible_damage_q
+        "1Z999AA10123456784", # tracking number → delivery_problem_type_q
+        "damaged_in_transit", # → delivery_visible_damage_q
         "yes_box_damage",     # delivery_visible_damage_q → delivery_signed_q
         "signed_cleared",     # delivery_signed_q → delivery_signed_cleared_terminal
     ])
@@ -192,6 +334,62 @@ def test_delivery_tracking_box_damage_signed_cleared():
     t = ticket(ticket_id)
     assert str(t.status) == "awaiting_admin_review"
     assert t.get_collected().get("tracking_number") == "1Z999AA10123456784"
+
+
+def test_delivery_missing_parts_path():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "delivery",
+        "damage_issue",
+        "no_tracking",
+        "customer@example.com",
+        "missing_parts",
+        "remote control and side bolts",
+    ])
+
+    assert result["next_node_id"] == "delivery_missing_parts_terminal"
+    assert result["is_terminal"] is True
+    t = ticket(ticket_id)
+    assert str(t.status) == "awaiting_admin_review"
+    assert t.get_collected().get("missing_parts_description") == "remote control and side bolts"
+
+
+def test_delivery_never_arrived_path():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "delivery",
+        "damage_issue",
+        "has_tracking",
+        "1Z999AA10123456784",
+        "never_arrived",
+    ])
+
+    assert result["next_node_id"] == "delivery_never_arrived_terminal"
+    assert result["is_terminal"] is True
+
+
+def test_delivery_box_fine_but_chair_damaged_continues_to_signed():
+    ticket_id, _ = start()
+
+    result = walk(ticket_id, [
+        "warranty",
+        "delivery",
+        "damage_issue",
+        "has_tracking",
+        "1Z999AA10123456784",
+        "damaged_in_transit",
+        "no_box_damage",
+        "yes_chair_inside_damage",
+        "signed_damaged",
+        "visible_at_unboxing",
+    ])
+
+    assert result["next_node_id"] == "delivery_replace_claim_terminal"
+    assert result["is_terminal"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +468,7 @@ def test_defect_power_recline_actuator():
     assert "video_of_issue" in result["evidence_required"]
 
     turns = WarrantyEngine.get_turns(ticket_id)
-    assert len(turns) == 6
+    assert len(turns) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +485,7 @@ def test_invalid_answer_raises():
 def test_double_answer_on_terminal_raises():
     ticket_id, _ = start()
     # Reach install_send_video terminal
-    walk(ticket_id, ["warranty", "installation", "Titan Pro Commander"])
+    walk(ticket_id, ["warranty", "installation", "Titan Pro Commander", "general_setup"])
 
     # Ticket is now in send_info (terminal reached). Further answers should raise.
     with pytest.raises(ValueError, match="no longer in progress"):
@@ -435,8 +633,8 @@ def test_yes_no_branch_air_feet_never_worked_pump_terminal():
         "feet_calves", # → defect_air_feet_worked_q
     ])
 
-    # Choose NO branch
-    result = WarrantyEngine.submit_answer(ticket_id, "never_worked")
+    # Choose NO branch (gate auto-dismissed in submit helper)
+    result = submit(ticket_id, "never_worked")
     assert result["next_node_id"] == "defect_air_pump_terminal"
     assert result["is_terminal"] is True
     assert result["terminal_class"] == "awaiting_admin_review"
@@ -622,6 +820,31 @@ class TestWarrantyTools:
         )
         assert "WARRANTY_ANSWER_MISMATCH" in result
         assert "VALID OPTIONS" in result
+
+    def test_tool_answer_does_not_nlp_advance_menu_from_free_text(self):
+        """Option menus stay put when the model guesses a nearby answer_key."""
+        from agent_tools import tool_start_warranty_workflow, tool_answer_warranty_question
+        from warranty_workflow import WarrantyEngine
+
+        start_result = tool_start_warranty_workflow(
+            session_id="no-nlp-advance",
+            domain="osaki.com",
+        )
+        ticket_id = None
+        for line in start_result.splitlines():
+            if line.startswith("TICKET_ID:"):
+                ticket_id = line.split(":", 1)[1].strip()
+                break
+        assert ticket_id is not None
+        before = WarrantyEngine.get_current_node(ticket_id)["node_id"]
+        result = tool_answer_warranty_question(
+            ticket_id=ticket_id,
+            answer_key="not_a_real_key",
+            customer_text="asdf qwerty not an option",
+        )
+        after = WarrantyEngine.get_current_node(ticket_id)["node_id"]
+        assert after == before
+        assert "WARRANTY_ANSWER_MISMATCH" in result
 
     def test_tool_attach_warranty_evidence_records_metadata(self):
         """attach_warranty_evidence records metadata for a valid ticket."""
@@ -882,3 +1105,65 @@ class TestAdminDecision:
                 ticket_id="ghost-ticket-999",
                 note="This should fail.",
             )
+
+
+# ---------------------------------------------------------------------------
+# Go back (rewind one turn)
+# ---------------------------------------------------------------------------
+
+def test_go_back_restores_previous_question():
+    ticket_id, _ = start()
+    walk(ticket_id, ["warranty", "defect", "voice"])
+
+    t = ticket(ticket_id)
+    assert str(t.defect_type) == "voice"
+    assert len(WarrantyEngine.get_turns(ticket_id)) == 3
+
+    result = WarrantyEngine.go_back(ticket_id)
+    assert result["restored_node_id"] == "defect_problem_type"
+    assert result["turn_count"] == 2
+
+    t = ticket(ticket_id)
+    assert str(t.issue_type) == "defect"
+    assert t.defect_type is None
+    assert str(t.current_node_id) == "defect_problem_type"
+    assert str(t.status) == "in_progress"
+    assert WarrantyEngine.can_go_back(ticket_id) is True
+
+
+def test_go_back_from_issue_type_keeps_registered_model():
+    ticket_id, _ = start()
+    submit(ticket_id, "warranty")
+    WarrantyEngine.set_model_name(ticket_id, "OS-4000T")
+    submit(ticket_id, "defect")
+
+    assert str(ticket(ticket_id).current_node_id) == "defect_problem_type"
+
+    WarrantyEngine.go_back(ticket_id)
+
+    t = ticket(ticket_id)
+    assert str(t.model_name) == "OS-4000T"
+    assert str(t.current_node_id) == "issue_type"
+    assert t.issue_type is None
+    assert len(WarrantyEngine.get_turns(ticket_id)) == 1
+
+
+def test_go_back_blocked_at_root_without_turns():
+    ticket_id, _ = start()
+    assert WarrantyEngine.can_go_back(ticket_id) is False
+    with pytest.raises(ValueError, match="Nothing to go back"):
+        WarrantyEngine.go_back(ticket_id)
+
+
+def test_go_back_blocked_after_terminal():
+    ticket_id, _ = start()
+    walk(ticket_id, [
+        "warranty",
+        "installation",
+        "OS-4000T",
+        "general_setup",
+    ])
+    t = ticket(ticket_id)
+    assert str(t.status) == "send_info"
+    with pytest.raises(ValueError, match="Cannot go back"):
+        WarrantyEngine.go_back(ticket_id)

@@ -1,8 +1,8 @@
 {
   "version": "1.1",
   "source": "WARRANTY FLOW CHART - MICHAEL - MICHAEL (2).pdf",
-  "updated": "2026-06-01",
-  "description": "Osaki/Titan warranty intake workflow. The backend engine controls ALL branching. The LLM only paraphrases 'prompt' fields into customer-friendly language. The LLM must NEVER decide on replacement, compensation, tech dispatch, or refund — those are admin-only actions reached through 'awaiting_admin' terminals.",
+  "updated": "2026-07-27",
+  "description": "Osaki/Titan warranty intake workflow. Delivery splits status lookup vs damage claim. The backend engine controls ALL branching. The LLM only paraphrases 'prompt' fields into customer-friendly language. The LLM must NEVER decide on replacement, compensation, tech dispatch, or refund — those are admin-only actions reached through 'awaiting_admin' terminals.",
   "root": "root",
   "nodes": {
 
@@ -25,19 +25,77 @@
 
     "issue_type": {
       "type": "question",
-      "prompt": "What type of warranty issue are you experiencing?",
+      "prompt": "Which area do you need help with: setup, delivery, or a chair malfunction?",
       "options": [
         {"label": "Installation Issue",    "answer_key": "installation", "next": "install_model"},
-        {"label": "Delivery Issue",        "answer_key": "delivery",     "next": "delivery_tracking_q"},
+        {"label": "Delivery Issue",        "answer_key": "delivery",     "next": "delivery_intent_q"},
         {"label": "Defect / Malfunction",  "answer_key": "defect",       "next": "defect_problem_type"}
       ]
+    },
+
+    "delivery_intent_q": {
+      "type": "question",
+      "prompt": "How can we help with your delivery today?",
+      "options": [
+        {"label": "Check delivery / tracking status", "answer_key": "status_check", "next": "delivery_status_tracking_q"},
+        {"label": "Report damage or a delivery problem", "answer_key": "damage_issue", "next": "delivery_tracking_q"}
+      ]
+    },
+
+    "delivery_status_tracking_q": {
+      "type": "question",
+      "prompt": "Do you have a tracking number for your delivery?",
+      "options": [
+        {"label": "No, I don't have a tracking number", "answer_key": "no_tracking",  "next": "delivery_status_get_order_email"},
+        {"label": "Yes, I have my tracking number",     "answer_key": "has_tracking", "next": "delivery_status_get_tracking"}
+      ]
+    },
+
+    "delivery_status_get_order_email": {
+      "type": "question_text",
+      "prompt": "Please share your checkout email (preferred). If you also have an order number, include both — for example: #12345 you@example.com so we can look up your delivery status.",
+      "answer_key": "order_or_email",
+      "next": "delivery_status_terminal"
+    },
+
+    "delivery_status_get_tracking": {
+      "type": "question_text",
+      "prompt": "Please share your tracking number so we can look up your delivery status.",
+      "answer_key": "tracking_number",
+      "next": "delivery_status_terminal"
+    },
+
+    "delivery_status_terminal": {
+      "type": "terminal",
+      "action": "awaiting_admin",
+      "prompt": "Thanks — we've received your details and looked up what we can on our side. Our team will follow up with your delivery status shortly.",
+      "internal_note": "Status-only delivery inquiry. Use collected order/email/tracking + delivery_lookup snapshot. Check Netsuite/Shopify/carrier and reply to the customer.",
+      "evidence_required": []
     },
 
     "install_model": {
       "type": "question_text",
       "prompt": "What model is your massage chair? (e.g., OS-4000T, Titan Pro Commander)",
       "answer_key": "model_name",
-      "next": "install_send_video"
+      "next": "install_concern"
+    },
+
+    "install_concern": {
+      "type": "question",
+      "prompt": "What installation issue are you having?",
+      "options": [
+        {"label": "Footrest problem or no air anywhere on the chair", "answer_key": "footrest_or_no_air", "next": "install_air_hose_terminal"},
+        {"label": "General assembly / setup help",                  "answer_key": "general_setup",      "next": "install_send_video"},
+        {"label": "Other installation issue",                         "answer_key": "other",              "next": "install_send_video"}
+      ]
+    },
+
+    "install_air_hose_terminal": {
+      "type": "terminal",
+      "action": "send_info",
+      "prompt": "Many footrest and whole-chair air issues are fixed by reconnecting the air hose between the footrest and the base. I'll walk you through the steps and share your model's installation video.",
+      "internal_note": "Post-install: footrest-to-base air hose often not connected during assembly. Customer-safe DIY first; team follow-up if still no air.",
+      "evidence_required": []
     },
 
     "install_send_video": {
@@ -59,16 +117,85 @@
 
     "delivery_get_name": {
       "type": "question_text",
-      "prompt": "No problem! Please provide your order number OR the email address used at checkout, and we will look up your delivery status right away.",
+      "prompt": "Please share your checkout email (preferred). If you also have an order number, include both — for example: #12345 you@example.com. Next we'll ask what kind of delivery problem you have.",
       "answer_key": "order_or_email",
-      "next": "delivery_visible_damage_q"
+      "next": "delivery_problem_type_q"
     },
 
     "delivery_get_tracking_number": {
       "type": "question_text",
-      "prompt": "Please share your tracking number and we will check the status right away.",
+      "prompt": "Please share your tracking number so we can locate your shipment. Next we'll ask what kind of delivery problem you have.",
       "answer_key": "tracking_number",
-      "next": "delivery_visible_damage_q"
+      "next": "delivery_problem_type_q"
+    },
+
+    "delivery_problem_type_q": {
+      "type": "question",
+      "prompt": "What best describes the delivery problem?",
+      "options": [
+        {"label": "Box or chair arrived damaged", "answer_key": "damaged_in_transit", "next": "delivery_visible_damage_q"},
+        {"label": "Missing parts or incomplete delivery", "answer_key": "missing_parts", "next": "delivery_missing_parts_q"},
+        {"label": "Wrong item was delivered", "answer_key": "wrong_item", "next": "delivery_wrong_item_terminal"},
+        {"label": "Never arrived / marked delivered but missing", "answer_key": "never_arrived", "next": "delivery_never_arrived_terminal"},
+        {"label": "Delivery was late", "answer_key": "late_delivery", "next": "delivery_late_terminal"},
+        {"label": "Something else", "answer_key": "other_delivery_problem", "next": "delivery_other_problem_q"}
+      ]
+    },
+
+    "delivery_missing_parts_q": {
+      "type": "question_text",
+      "prompt": "What parts or items are missing from your delivery?",
+      "answer_key": "missing_parts_description",
+      "next": "delivery_missing_parts_terminal"
+    },
+
+    "delivery_missing_parts_terminal": {
+      "type": "terminal",
+      "action": "awaiting_admin",
+      "prompt": "Thanks — we've noted the missing items. Please send photos of what you received (and the packing list if you have it). Our team will follow up to arrange the missing parts.",
+      "internal_note": "Missing parts / incomplete delivery. Review order BOM vs customer description + photos. Ship missing parts or open carrier claim as needed.",
+      "evidence_required": ["damage_photos"],
+      "evidence_email": "service@osakititan.com"
+    },
+
+    "delivery_wrong_item_terminal": {
+      "type": "terminal",
+      "action": "awaiting_admin",
+      "prompt": "Thanks — please send photos of the item you received (labels/serial if visible). Our team will confirm the order and arrange the correct product or a return label.",
+      "internal_note": "Wrong item delivered. Compare Shopify/Netsuite order to photos. Arrange swap / return label / pickup.",
+      "evidence_required": ["damage_photos"],
+      "evidence_email": "service@osakititan.com"
+    },
+
+    "delivery_never_arrived_terminal": {
+      "type": "terminal",
+      "action": "awaiting_admin",
+      "prompt": "Thanks — we've logged that the shipment never arrived (or was marked delivered but is missing). Our team will check carrier tracking and follow up with next steps.",
+      "internal_note": "Never arrived / porch theft / false delivery scan. Check Track123/carrier POD, file claim or reship per policy.",
+      "evidence_required": []
+    },
+
+    "delivery_late_terminal": {
+      "type": "terminal",
+      "action": "awaiting_admin",
+      "prompt": "Thanks — we've noted the late delivery. Our team will review the carrier timeline and follow up with an update or goodwill options if appropriate.",
+      "internal_note": "Late delivery complaint. Verify ETA vs actual; carrier delay vs warehouse delay. Reply with status / courtesy credit if policy allows.",
+      "evidence_required": []
+    },
+
+    "delivery_other_problem_q": {
+      "type": "question_text",
+      "prompt": "Please briefly describe the delivery problem so our team can help.",
+      "answer_key": "other_delivery_problem_description",
+      "next": "delivery_other_problem_terminal"
+    },
+
+    "delivery_other_problem_terminal": {
+      "type": "terminal",
+      "action": "awaiting_admin",
+      "prompt": "Thank you for the details. Our team will review your delivery situation and follow up shortly.",
+      "internal_note": "Other delivery problem (free-text). Read customer description + tracking snapshot; route to correct ops owner.",
+      "evidence_required": []
     },
 
     "delivery_visible_damage_q": {
@@ -76,16 +203,17 @@
       "prompt": "When the chair was delivered, was there any visible damage to the outer shipping box?",
       "options": [
         {"label": "Yes, the box was visibly damaged", "answer_key": "yes_box_damage", "next": "delivery_signed_q"},
-        {"label": "No, the box appeared fine",        "answer_key": "no_box_damage",  "next": "delivery_no_box_damage_terminal"}
+        {"label": "No, the box appeared fine",        "answer_key": "no_box_damage",  "next": "delivery_chair_inside_damage_q"}
       ]
     },
 
-    "delivery_no_box_damage_terminal": {
-      "type": "terminal",
-      "action": "awaiting_admin",
-      "prompt": "Thank you for the information. Our team will follow up on your delivery situation.",
-      "internal_note": "Tracking provided and no visible box damage. Look up order in Netsuite, contact the carrier, and provide a status update to the customer.",
-      "evidence_required": []
+    "delivery_chair_inside_damage_q": {
+      "type": "question",
+      "prompt": "Was the chair itself damaged when you opened the box (even though the outer box looked fine)?",
+      "options": [
+        {"label": "Yes, the chair was damaged inside", "answer_key": "yes_chair_inside_damage", "next": "delivery_signed_q"},
+        {"label": "No chair damage — something else", "answer_key": "no_chair_inside_damage", "next": "delivery_other_problem_q"}
+      ]
     },
 
     "delivery_signed_q": {
@@ -135,7 +263,7 @@
 
     "defect_problem_type": {
       "type": "question",
-      "prompt": "What type of problem are you experiencing with your chair?",
+      "prompt": "Which chair part or function is affected?",
       "options": [
         {"label": "Air / Inflation not working",                          "answer_key": "air",      "next": "defect_air_location"},
         {"label": "Cosmetic damage (physical damage to appearance)",      "answer_key": "cosmetic", "next": "defect_cosmetic_location"},
@@ -143,8 +271,79 @@
         {"label": "Full rolling massage mechanism issue",                 "answer_key": "rolling",  "next": "defect_rolling_problem_type"},
         {"label": "Power issue (chair won't turn on or has power problems)", "answer_key": "power", "next": "defect_power_remote_on_q"},
         {"label": "Recline / position adjustment not working",            "answer_key": "recline",  "next": "defect_recline_which"},
-        {"label": "Footrest issue",                                       "answer_key": "footrest", "next": "defect_footrest_which"}
+        {"label": "Footrest issue",                                       "answer_key": "footrest", "next": "defect_footrest_which"},
+        {"label": "Heating / temperature issue",                          "answer_key": "heat",     "next": "defect_heating_which"},
+        {"label": "Voice control issue",                                  "answer_key": "voice",    "next": "defect_voice_which"}
       ]
+    },
+
+    "defect_heating_which": {
+      "type": "question",
+      "prompt": "Which heating issue best describes your situation?",
+      "options": [
+        {"label": "Heating does not warm up at all",            "answer_key": "not_heating",  "next": "defect_heating_warmup_q"},
+        {"label": "Heat turns on and off / works intermittently", "answer_key": "intermittent", "next": "defect_heating_intermittent_terminal"},
+        {"label": "Heat feels too hot or uneven",                "answer_key": "too_hot",      "next": "defect_heating_too_hot_terminal"}
+      ]
+    },
+
+    "defect_heating_warmup_q": {
+      "type": "question",
+      "prompt": "Massage chair heat is mild and takes time to build up. Have you run the heated program for at least 10 minutes and confirmed heat is turned ON from the remote?",
+      "options": [
+        {"label": "Yes, ran for 10+ minutes with heat ON — still no warmth", "answer_key": "still_no_heat",   "next": "defect_heating_not_heating_terminal"},
+        {"label": "No — I'll try a 10-minute warm-up first",                 "answer_key": "will_try_warmup", "next": "defect_heating_not_heating_terminal"}
+      ]
+    },
+
+    "defect_heating_not_heating_terminal": {
+      "type": "terminal",
+      "action": "send_info",
+      "prompt": "Let's confirm heat is enabled and give the chair time to warm up before deciding it needs service.",
+      "internal_note": "Heat reported not working. Confirm 10+ min warm-up, heat icon on remote ON, no thick covers blocking element. If still cold after DIY, advise the customer to contact warranty support for a heating-element review.",
+      "evidence_required": []
+    },
+
+    "defect_heating_intermittent_terminal": {
+      "type": "terminal",
+      "action": "send_info",
+      "prompt": "Heat turning on and off can be normal cycling, but if heat fails completely after a while, our team can review the element.",
+      "internal_note": "Intermittent heat. DIY: time how long heat stays on, power cycle, retest. Recommend warranty support review if the pattern repeats.",
+      "evidence_required": []
+    },
+
+    "defect_heating_too_hot_terminal": {
+      "type": "terminal",
+      "action": "send_info",
+      "prompt": "If heat feels too hot or uneven, stop using it and let the chair cool down before testing again. Our team can check the heating element if it persists.",
+      "internal_note": "Heat too hot / uneven. Safety first: stop use, cool 30 min, no thick blankets covering element. Escalate if repeats.",
+      "evidence_required": []
+    },
+
+    "defect_voice_which": {
+      "type": "question",
+      "prompt": "Which voice control issue best describes your situation?",
+      "options": [
+        {"label": "Voice control does not respond to my commands",     "answer_key": "voice_no_response",  "next": "defect_voice_not_working_terminal"},
+        {"label": "Voice picks up random commands / false triggers", "answer_key": "false_triggers",     "next": "defect_voice_false_triggers_terminal"},
+        {"label": "Not sure",                                        "answer_key": "voice_not_sure",     "next": "defect_voice_not_working_terminal"}
+      ]
+    },
+
+    "defect_voice_not_working_terminal": {
+      "type": "terminal",
+      "action": "send_info",
+      "prompt": "Let's try a few voice control checks — many issues are fixed with the right commands and microphone placement.",
+      "internal_note": "Voice not responding. Customer-safe DIY: supported commands, mic location, side panel connections. Team follow-up if still dead.",
+      "evidence_required": []
+    },
+
+    "defect_voice_false_triggers_terminal": {
+      "type": "terminal",
+      "action": "send_info",
+      "prompt": "False voice triggers are often caused by background noise or TV audio. Here are settings and placement tips.",
+      "internal_note": "Ghost/random voice pickup. Customer-safe: settings off, unplug when idle, reduce noise. Not a defect if sensitivity picks up ambient speech.",
+      "evidence_required": []
     },
 
     "defect_air_location": {

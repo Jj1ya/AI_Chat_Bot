@@ -25,12 +25,136 @@ def test_parse_order_or_email_detects_order():
     assert parse_order_or_email("#12345") == ("12345", "")
 
 
+def test_parse_order_or_email_detects_both():
+    assert parse_order_or_email("#12345 buyer@example.com") == (
+        "12345",
+        "buyer@example.com",
+    )
+
+
+def test_parse_order_or_email_wordy_paste():
+    assert parse_order_or_email("order 12345 email buyer@example.com") == (
+        "12345",
+        "buyer@example.com",
+    )
+    assert parse_order_or_email("Order #: OSK12345 / email: buyer@example.com") == (
+        "OSK12345",
+        "buyer@example.com",
+    )
+
+
+def test_admin_lookup_failure_reason_maps_codes():
+    from delivery_lookup import admin_lookup_failure_reason
+
+    assert "Shopify" in admin_lookup_failure_reason("order_lookup_failed")
+    assert "Carrier" in admin_lookup_failure_reason("carrier_lookup_failed")
+    assert "privacy" in admin_lookup_failure_reason(
+        "For your privacy, we need the checkout email."
+    ).lower()
+
+
+def test_lookup_by_order_requires_email(monkeypatch):
+    called = {"n": 0}
+
+    class FakeMain:
+        @staticmethod
+        def fetch_shopify_order_status(*_a, **_k):
+            called["n"] += 1
+            return {"status": "FULFILLED"}
+
+    monkeypatch.setattr("delivery_lookup._lazy_logistics", lambda: FakeMain())
+    snap = lookup_by_order_or_email("#12345", "osaki.com")
+    assert snap.available is False
+    assert "privacy" in (snap.error or "").lower()
+    assert called["n"] == 0
+
+
 def test_format_unavailable_message():
     msg = format_warranty_tracking_message(
         TrackingSnapshot(source="unavailable", available=False, error="not found")
     )
     assert "couldn't verify" in msg.lower()
-    assert "not found" in msg
+    assert "saved what you entered" in msg.lower()
+    assert "not found" not in msg
+
+
+def test_format_unavailable_keeps_privacy_prompt():
+    msg = format_warranty_tracking_message(
+        TrackingSnapshot(
+            source="unavailable",
+            available=False,
+            error="For your privacy, we need the checkout email.",
+        )
+    )
+    assert "privacy" in msg.lower()
+
+
+def test_safe_lookup_swallows_shopify_exception(monkeypatch):
+    from delivery_lookup import safe_lookup_by_order_or_email
+
+    class Boom:
+        @staticmethod
+        def fetch_shopify_order_status(*_a, **_k):
+            raise RuntimeError("shopify timeout")
+
+    monkeypatch.setattr("delivery_lookup._lazy_logistics", lambda: Boom())
+    snap = safe_lookup_by_order_or_email(
+        "#12345 buyer@example.com", "osaki.com"
+    )
+    assert snap.available is False
+    assert snap.order_number == "12345"
+    assert snap.error == "order_lookup_failed"
+
+
+def test_safe_lookup_swallows_carrier_exception(monkeypatch):
+    from delivery_lookup import safe_lookup_by_tracking_number
+
+    class Boom:
+        @staticmethod
+        def get_store_config(_domain):
+            return {}
+
+        @staticmethod
+        def enrich_tracking_from_track123(*_a, **_k):
+            raise RuntimeError("track123 down")
+
+    monkeypatch.setattr("delivery_lookup._lazy_logistics", lambda: Boom())
+    snap = safe_lookup_by_tracking_number("1Z999AA10123456784", "osaki.com")
+    assert snap.available is False
+    assert snap.tracking_number == "1Z999AA10123456784"
+    assert snap.error == "carrier_lookup_failed"
+
+
+def test_format_unavailable_message_includes_self_service_links():
+    msg = format_warranty_tracking_message(
+        TrackingSnapshot(source="unavailable", available=False, error="not found"),
+        domain="osakiusa.com",
+        lookup_kind="order",
+        raw_input="buyer@example.com",
+    )
+    assert "Track on our website" in msg
+    assert "https://osakiusa.com/apps/track123" in msg
+
+
+def test_build_carrier_tracking_url_ups():
+    from delivery_lookup import build_carrier_tracking_url
+
+    url = build_carrier_tracking_url("1Z999AA10123456784")
+    assert "ups.com" in url
+    assert "1Z999AA10123456784" in url
+
+
+def test_build_self_service_lookup_links_for_tracking():
+    from delivery_lookup import build_self_service_lookup_links
+
+    links = build_self_service_lookup_links(
+        domain="titanchair.com",
+        lookup_kind="tracking",
+        raw_input="1Z999AA10123456784",
+    )
+    labels = [label for label, _url in links]
+    assert "Track on our website" in labels
+    assert "Track with the carrier" in labels
 
 
 def test_format_success_message_includes_tracking():
@@ -45,6 +169,34 @@ def test_format_success_message_includes_tracking():
     msg = format_warranty_tracking_message(snap)
     assert "IN_TRANSIT" in msg
     assert "1Z999AA10123456784" in msg
+    assert "We'll continue with your delivery warranty questions below." in msg
+
+
+def test_format_success_message_status_path_does_not_promise_more_questions():
+    snap = TrackingSnapshot(
+        source="track123",
+        available=True,
+        status="IN_TRANSIT",
+        carrier="UPS",
+        tracking_number="1Z999AA10123456784",
+    )
+    msg = format_warranty_tracking_message(snap, continue_with_questions=False)
+    assert "IN_TRANSIT" in msg
+    assert "We'll continue with your delivery warranty questions below." not in msg
+    assert "Our team will follow up shortly" in msg
+
+
+def test_format_processing_message_status_path_closing():
+    snap = TrackingSnapshot(
+        source="shopify",
+        available=True,
+        status="PROCESSING",
+        order_number="#1001",
+    )
+    msg = format_warranty_tracking_message(snap, continue_with_questions=False)
+    assert "PROCESSING" in msg
+    assert "We'll continue with your delivery warranty questions below." not in msg
+    assert "Our team will follow up shortly" in msg
 
 
 def test_format_success_message_includes_order_details():
@@ -124,6 +276,39 @@ def test_lookup_by_tracking_number_uses_track123(monkeypatch):
     assert snap.available is True
     assert snap.source == "track123"
     assert snap.tracking_number == "1Z999AA10123456784"
+
+
+def test_lookup_by_tracking_number_falls_back_to_aftership(monkeypatch):
+    class FakeMain:
+        @staticmethod
+        def get_store_config(domain):
+            return {}
+
+        @staticmethod
+        def enrich_tracking_from_track123(*_a, **_k):
+            return {}
+
+        @staticmethod
+        def enrich_tracking_from_aftership(carrier, tn):
+            assert tn == "1Z999AA10123456784"
+            return {
+                "status": "IN_TRANSIT",
+                "company": "UPS",
+                "eta": "Tomorrow",
+                "last_event": "On vehicle",
+                "current_location": "Austin, TX",
+                "events": [],
+            }
+
+        @staticmethod
+        def resolve_carrier_name(*_a, **_k):
+            return "UPS"
+
+    monkeypatch.setattr("delivery_lookup._lazy_logistics", lambda: FakeMain())
+    snap = lookup_by_tracking_number("1Z999AA10123456784", "osaki.com")
+    assert snap.available is True
+    assert snap.source == "aftership"
+    assert snap.carrier == "UPS"
 
 
 def test_lookup_by_order_or_email_shopify(monkeypatch):

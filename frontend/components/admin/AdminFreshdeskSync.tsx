@@ -1,0 +1,516 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+interface TicketSyncResult {
+  ok?: boolean;
+  ticket_count?: number;
+  knowledge_freshdesk_entries?: number;
+  knowledge_freshdesk_kb_entries?: number;
+  knowledge_total_entries?: number;
+  knowledge_yield?: {
+    ticket_rows_to_knowledge_pct?: number | null;
+    resolved_to_knowledge_pct?: number | null;
+    kb_articles_to_knowledge_pct?: number | null;
+  };
+  resolved_scanned?: number;
+  usable_qa_pairs?: number;
+  search_pages_fetched?: number;
+  month_windows_scanned?: number;
+  fetch_mode?: string;
+  llm_rescue_enabled?: boolean;
+  llm_rescue_stats?: {
+    processed?: number;
+    rescued?: number;
+    cached?: number;
+    skipped?: number;
+    errors?: number;
+  };
+  faiss_rebuild_scheduled?: boolean;
+  message?: string;
+  detail?: string;
+}
+
+interface SolutionsSyncResult {
+  ok?: boolean;
+  article_count?: number;
+  knowledge_freshdesk_kb_entries?: number;
+  knowledge_total_entries?: number;
+  knowledge_yield?: {
+    kb_articles_to_knowledge_pct?: number | null;
+  };
+  faiss_rebuild_scheduled?: boolean;
+  message?: string;
+  detail?: string;
+}
+
+interface KbProbeResult {
+  reachable?: boolean;
+  categories?: number;
+  folders?: number;
+  articles?: number;
+  error?: string;
+  detail?: string;
+}
+
+interface FaissStatus {
+  running?: boolean;
+  ok?: boolean;
+  ticket_docs?: number;
+  kb_docs?: number;
+  csv_docs?: number;
+  total_docs?: number;
+  finished_at?: number;
+  error?: string;
+  scheduled?: boolean;
+  message?: string;
+  detail?: string;
+}
+
+interface FreshdeskStatus {
+  configured?: boolean;
+  connection_ok?: boolean | null;
+  domain?: string | null;
+  portal_url?: string | null;
+  outbound?: {
+    create_case_enabled?: boolean;
+    group_id?: string | null;
+    product_id?: string | null;
+  };
+  files?: {
+    tickets?: { exists?: boolean; count?: number; modified_at?: string | null };
+    kb?: { exists?: boolean; count?: number; modified_at?: string | null };
+  };
+  last_sync?: {
+    tickets?: { last_sync_at?: string; ok?: boolean; ticket_count?: number; message?: string };
+    kb?: { last_sync_at?: string; ok?: boolean; article_count?: number; message?: string };
+  };
+  stale?: { tickets?: boolean; kb?: boolean; threshold_days?: number };
+  knowledge?: { total?: number; freshdesk?: number; freshdesk_kb?: number };
+  detail?: string;
+}
+
+function formatIso(iso?: string | null): string {
+  if (!iso) return "never";
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
+}
+
+function formatTs(ts?: number): string {
+  if (!ts) return "";
+  try {
+    return new Date(ts * 1000).toLocaleString();
+  } catch {
+    return "";
+  }
+}
+
+export default function AdminFreshdeskSync() {
+  const [ticketLoading, setTicketLoading] = useState(false);
+  const [kbLoading, setKbLoading] = useState(false);
+  const [probeLoading, setProbeLoading] = useState(false);
+  const [rebuildLoading, setRebuildLoading] = useState(false);
+
+  const [llmRescue, setLlmRescue] = useState(true);
+  const [rebuildAfter, setRebuildAfter] = useState(true);
+  const [syncMaxPages, setSyncMaxPages] = useState(30);
+  const [syncMonthsBack, setSyncMonthsBack] = useState(12);
+
+  const [ticketResult, setTicketResult] = useState<TicketSyncResult | null>(null);
+  const [kbResult, setKbResult] = useState<SolutionsSyncResult | null>(null);
+  const [probe, setProbe] = useState<KbProbeResult | null>(null);
+  const [faiss, setFaiss] = useState<FaissStatus | null>(null);
+  const [fdStatus, setFdStatus] = useState<FreshdeskStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void refreshFaiss();
+    void refreshFreshdeskStatus();
+  }, []);
+
+  async function refreshFreshdeskStatus() {
+    try {
+      const res = await fetch("/api/admin/warranty/freshdesk-status");
+      const data = (await res.json()) as FreshdeskStatus;
+      if (res.ok) setFdStatus(data);
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  async function refreshFaiss() {
+    try {
+      const res = await fetch("/api/admin/warranty/rebuild-faiss", {
+        method: "GET",
+      });
+      const data = (await res.json()) as FaissStatus;
+      if (res.ok) setFaiss(data);
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  async function handleTicketSync() {
+    setTicketLoading(true);
+    setError(null);
+    setTicketResult(null);
+    try {
+      const qs = new URLSearchParams({
+        max_pages: String(syncMaxPages),
+        months_back: String(syncMonthsBack),
+        llm_rescue: llmRescue ? "true" : "false",
+        rebuild_faiss: rebuildAfter ? "true" : "false",
+      });
+      const res = await fetch(`/api/admin/warranty/sync-freshdesk?${qs}`, {
+        method: "POST",
+      });
+      const data = (await res.json()) as TicketSyncResult;
+      if (!res.ok) {
+        throw new Error(data.detail ?? data.message ?? `HTTP ${res.status}`);
+      }
+      setTicketResult(data);
+      if (rebuildAfter) setTimeout(() => void refreshFaiss(), 2000);
+      void refreshFreshdeskStatus();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Ticket sync failed.");
+    } finally {
+      setTicketLoading(false);
+    }
+  }
+
+  async function handleKbSync() {
+    setKbLoading(true);
+    setError(null);
+    setKbResult(null);
+    try {
+      const qs = new URLSearchParams({
+        rebuild_faiss: rebuildAfter ? "true" : "false",
+      });
+      const res = await fetch(`/api/admin/warranty/sync-freshdesk-solutions?${qs}`, {
+        method: "POST",
+      });
+      const data = (await res.json()) as SolutionsSyncResult;
+      if (!res.ok) {
+        throw new Error(data.detail ?? data.message ?? `HTTP ${res.status}`);
+      }
+      setKbResult(data);
+      if (rebuildAfter) setTimeout(() => void refreshFaiss(), 2000);
+      void refreshFreshdeskStatus();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "KB sync failed.");
+    } finally {
+      setKbLoading(false);
+    }
+  }
+
+  async function handleProbe() {
+    setProbeLoading(true);
+    setError(null);
+    setProbe(null);
+    try {
+      const res = await fetch("/api/admin/warranty/freshdesk-solutions-probe");
+      const data = (await res.json()) as KbProbeResult;
+      if (!res.ok) {
+        throw new Error(data.detail ?? data.error ?? `HTTP ${res.status}`);
+      }
+      setProbe(data);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "KB probe failed.");
+    } finally {
+      setProbeLoading(false);
+    }
+  }
+
+  async function handleRebuild() {
+    setRebuildLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin/warranty/rebuild-faiss", {
+        method: "POST",
+      });
+      const data = (await res.json()) as FaissStatus;
+      if (!res.ok) {
+        throw new Error(data.detail ?? data.message ?? `HTTP ${res.status}`);
+      }
+      setTimeout(() => void refreshFaiss(), 2000);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Rebuild failed.");
+    } finally {
+      setRebuildLoading(false);
+    }
+  }
+
+  return (
+    <div className="space-y-3 rounded-xl border border-indigo-100 bg-indigo-50/50 p-4">
+      {fdStatus?.stale?.tickets || fdStatus?.stale?.kb ? (
+        <div
+          className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950"
+          role="status"
+        >
+          <strong>Knowledge may be stale.</strong>{" "}
+          Ticket sync
+          {fdStatus.stale?.tickets ? " is overdue" : " is OK"}
+          {fdStatus.stale?.kb ? "; KB sync is overdue" : "; KB sync is OK"}
+          {" "}
+          (threshold: {fdStatus.stale?.threshold_days ?? 7} days). Run sync below,
+          or schedule{" "}
+          <code className="rounded bg-amber-100 px-1 text-xs">script/sync_freshdesk.sh</code>{" "}
+          weekly on EC2.
+        </div>
+      ) : null}
+      {fdStatus && (
+        <div className="rounded-md border border-indigo-200 bg-white px-3 py-2 text-xs text-indigo-950">
+          <div className="mb-1 flex flex-wrap items-center gap-2">
+            <strong>Freshdesk health</strong>
+            {!fdStatus.configured ? (
+              <span className="rounded bg-amber-100 px-2 py-0.5 text-amber-900">
+                credentials missing
+              </span>
+            ) : fdStatus.connection_ok ? (
+              <span className="rounded bg-green-100 px-2 py-0.5 text-green-800">
+                API reachable
+              </span>
+            ) : fdStatus.connection_ok === false ? (
+              <span className="rounded bg-red-100 px-2 py-0.5 text-red-800">
+                API unreachable
+              </span>
+            ) : null}
+            {fdStatus.outbound?.create_case_enabled && (
+              <span className="rounded bg-indigo-100 px-2 py-0.5 text-indigo-800">
+                outbound cases on
+              </span>
+            )}
+          </div>
+          <div className="grid gap-1 text-[11px] text-indigo-900/90 sm:grid-cols-2">
+            <div>
+              Tickets JSON:{" "}
+              <strong>{fdStatus.files?.tickets?.count ?? 0}</strong>
+              {fdStatus.stale?.tickets && (
+                <span className="ml-1 text-amber-700">(stale)</span>
+              )}
+              {" · "}
+              last sync {formatIso(fdStatus.last_sync?.tickets?.last_sync_at)}
+            </div>
+            <div>
+              KB JSON: <strong>{fdStatus.files?.kb?.count ?? 0}</strong>
+              {fdStatus.stale?.kb && (
+                <span className="ml-1 text-amber-700">(stale)</span>
+              )}
+              {" · "}
+              last sync {formatIso(fdStatus.last_sync?.kb?.last_sync_at)}
+            </div>
+            <div>
+              Loaded knowledge:{" "}
+              <strong>{fdStatus.knowledge?.freshdesk ?? 0}</strong> tickets +{" "}
+              <strong>{fdStatus.knowledge?.freshdesk_kb ?? 0}</strong> KB
+            </div>
+            {fdStatus.portal_url && (
+              <div>
+                Portal:{" "}
+                <a
+                  href={fdStatus.portal_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline"
+                >
+                  {fdStatus.domain}
+                </a>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-3 text-xs">
+        <label className="flex items-center gap-1.5 text-indigo-900">
+          <input
+            type="checkbox"
+            checked={llmRescue}
+            onChange={(event) => setLlmRescue(event.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          <span>LLM rescue (skip regex-drops)</span>
+        </label>
+        <label className="flex items-center gap-1.5 text-indigo-900">
+          <input
+            type="checkbox"
+            checked={rebuildAfter}
+            onChange={(event) => setRebuildAfter(event.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          <span>Rebuild FAISS after sync</span>
+        </label>
+        <label className="flex items-center gap-1.5 text-indigo-900">
+          <span>Search pages</span>
+          <input
+            type="number"
+            min={1}
+            max={60}
+            value={syncMaxPages}
+            onChange={(event) =>
+              setSyncMaxPages(Math.min(60, Math.max(1, Number(event.target.value) || 30)))
+            }
+            className="w-14 rounded border border-indigo-200 px-1.5 py-0.5 text-xs"
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-indigo-900">
+          <span>Months back</span>
+          <input
+            type="number"
+            min={1}
+            max={36}
+            value={syncMonthsBack}
+            onChange={(event) =>
+              setSyncMonthsBack(Math.min(36, Math.max(1, Number(event.target.value) || 12)))
+            }
+            className="w-14 rounded border border-indigo-200 px-1.5 py-0.5 text-xs"
+          />
+        </label>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={handleTicketSync}
+          disabled={ticketLoading}
+          className="rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-xs font-medium text-indigo-800 transition hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {ticketLoading ? "Syncing tickets…" : "↻ Sync Freshdesk tickets"}
+        </button>
+        <button
+          type="button"
+          onClick={handleKbSync}
+          disabled={kbLoading}
+          className="rounded-lg border border-emerald-300 bg-white px-3 py-1.5 text-xs font-medium text-emerald-800 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {kbLoading ? "Syncing KB…" : "📚 Sync Freshdesk KB (Solutions)"}
+        </button>
+        <button
+          type="button"
+          onClick={handleProbe}
+          disabled={probeLoading}
+          className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {probeLoading ? "Probing…" : "🔎 Probe KB counts"}
+        </button>
+        <button
+          type="button"
+          onClick={handleRebuild}
+          disabled={rebuildLoading || faiss?.running}
+          className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-800 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {rebuildLoading
+            ? "Scheduling…"
+            : faiss?.running
+              ? "FAISS rebuilding…"
+              : "🧱 Rebuild FAISS (freshdesk_qa)"}
+        </button>
+      </div>
+
+      {ticketResult?.ok && (
+        <div className="rounded-md border border-indigo-200 bg-white px-3 py-2 text-xs text-indigo-900">
+          <strong>{ticketResult.ticket_count ?? 0}</strong> Q&A saved
+          {ticketResult.resolved_scanned !== undefined && (
+            <>
+              {" "}
+              (scanned <strong>{ticketResult.resolved_scanned}</strong> resolved
+              {ticketResult.search_pages_fetched !== undefined && (
+                <> · {ticketResult.search_pages_fetched} search pages</>
+              )}
+              )
+            </>
+          )}
+          {" → "}
+          <strong>{ticketResult.knowledge_freshdesk_entries ?? 0}</strong> knowledge entries
+          {ticketResult.knowledge_freshdesk_kb_entries !== undefined && (
+            <>
+              {" "}
+              (+ <strong>{ticketResult.knowledge_freshdesk_kb_entries}</strong> KB)
+            </>
+          )}
+          {ticketResult.llm_rescue_stats && (
+            <>
+              {" "}
+              · LLM rescued <strong>{ticketResult.llm_rescue_stats.rescued ?? 0}</strong>
+              , cached {ticketResult.llm_rescue_stats.cached ?? 0}, skipped{" "}
+              {ticketResult.llm_rescue_stats.skipped ?? 0}
+            </>
+          )}
+          {ticketResult.knowledge_yield?.ticket_rows_to_knowledge_pct != null && (
+            <>
+              {" "}
+              · yield{" "}
+              <strong>{ticketResult.knowledge_yield.ticket_rows_to_knowledge_pct}%</strong>
+            </>
+          )}
+          {ticketResult.faiss_rebuild_scheduled && (
+            <> · FAISS rebuild scheduled</>
+          )}
+        </div>
+      )}
+      {ticketResult && ticketResult.ok === false && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          {ticketResult.message ?? "No tickets saved."}
+        </div>
+      )}
+
+      {kbResult?.ok && (
+        <div className="rounded-md border border-emerald-200 bg-white px-3 py-2 text-xs text-emerald-900">
+          <strong>{kbResult.article_count ?? 0}</strong> KB articles →{" "}
+          <strong>{kbResult.knowledge_freshdesk_kb_entries ?? 0}</strong> KB entries
+          {kbResult.knowledge_yield?.kb_articles_to_knowledge_pct != null && (
+            <>
+              {" "}
+              · yield{" "}
+              <strong>{kbResult.knowledge_yield.kb_articles_to_knowledge_pct}%</strong>
+            </>
+          )}
+          {kbResult.faiss_rebuild_scheduled && <> · FAISS rebuild scheduled</>}
+        </div>
+      )}
+      {kbResult && kbResult.ok === false && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          {kbResult.message ?? "No KB articles saved."}
+        </div>
+      )}
+
+      {probe && (
+        <div className="rounded-md border border-gray-200 bg-white px-3 py-2 text-xs text-gray-800">
+          KB probe: {probe.reachable ? "reachable" : "unreachable"} —{" "}
+          <strong>{probe.categories ?? 0}</strong> categories,{" "}
+          <strong>{probe.folders ?? 0}</strong> folders,{" "}
+          <strong>{probe.articles ?? 0}</strong> published articles
+          {probe.error && <span className="text-red-600"> · {probe.error}</span>}
+        </div>
+      )}
+
+      {faiss && (
+        <div className="rounded-md border border-amber-200 bg-white px-3 py-2 text-xs text-amber-900">
+          FAISS:{" "}
+          {faiss.running ? (
+            <strong>running…</strong>
+          ) : faiss.ok ? (
+            <>
+              last built with <strong>{faiss.total_docs ?? 0}</strong> docs (
+              tickets {faiss.ticket_docs ?? 0}, KB {faiss.kb_docs ?? 0}, CSV{" "}
+              {faiss.csv_docs ?? 0}) at {formatTs(faiss.finished_at)}
+            </>
+          ) : faiss.error ? (
+            <span className="text-red-600">last error: {faiss.error}</span>
+          ) : (
+            "no rebuild yet"
+          )}
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}

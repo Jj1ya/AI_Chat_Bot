@@ -28,6 +28,12 @@ Public API
   WarrantyEngine.submit_answer(ticket_id, raw_answer)
       → SubmitResult dict
 
+  WarrantyEngine.go_back(ticket_id)
+      → dict with restored_node_id, turn_count, can_go_back
+
+  WarrantyEngine.can_go_back(ticket_id)
+      → bool
+
   WarrantyEngine.get_ticket(ticket_id)
       → WarrantyTicket | None
 
@@ -82,6 +88,18 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from warranty_error_code_gate import (
+    COL_ERROR_CODE,
+    COL_GATE_COMPLETED,
+    COL_PENDING_TERMINAL,
+    GATE_ENTER_ID,
+    GATE_PICK_ID,
+    GATE_VISIBLE_ID,
+    finalize_error_code_submission,
+    intercept_terminal_node_id,
+    is_gate_node,
+    resolve_gate_node,
+)
 from warranty_models import (
     _SessionFactory,
     WarrantyTicket,
@@ -171,6 +189,82 @@ def _match_option(options: list[dict], raw_answer: str) -> Optional[dict]:
     return None
 
 
+def _resolve_node(node_id: str, ticket: Optional[WarrantyTicket] = None) -> Optional[dict]:
+    if is_gate_node(node_id):
+        if ticket is None:
+            return None
+        return resolve_gate_node(node_id, ticket)
+    node = _NODES.get(node_id)
+    if node is None:
+        return None
+    return {"node_id": node_id, **node}
+
+
+def _apply_pending_terminal(ticket: WarrantyTicket, pending_id: str) -> dict:
+    pending_node = _NODES[pending_id]
+    ticket.current_node_id = pending_id
+    ticket.status = _terminal_status(pending_node.get("action", "awaiting_admin"))
+    return pending_node
+
+
+# Keys preserved when rewinding workflow turns (model / intake context).
+_REWIND_PRESERVE_COLLECTED = (
+    "model_confirmed",
+    "model_name",
+    "intake_summary",
+    "intake_raw_message",
+)
+
+
+def _replay_turn_answer(turn: WarrantyTurn) -> tuple[str, Optional[str]]:
+    """Return (raw_answer, customer_display) for replaying a stored turn."""
+    customer = str(turn.customer_answer or "").strip()
+    answer_key = str(turn.answer_key or "").strip()
+    node_type = str(turn.node_type or "")
+    node_id = str(turn.node_id or "")
+
+    if node_type == "question_text":
+        raw = customer or answer_key
+        return raw, customer or None
+
+    if is_gate_node(node_id):
+        raw = customer or answer_key
+        display = customer if customer and customer != answer_key else None
+        return raw, display
+
+    raw = answer_key or customer
+    display = customer if customer and customer != raw else None
+    return raw, display
+
+
+def _build_submit_result(
+    *,
+    next_node_id: str,
+    previous_node_id: str,
+    next_node: dict,
+    answer_key: str,
+) -> dict:
+    is_terminal = next_node.get("type") == "terminal"
+    evidence_required: list[str] = []
+    evidence_email: Optional[str] = None
+    terminal_class: Optional[str] = None
+    if is_terminal:
+        action = next_node.get("action", "awaiting_admin")
+        terminal_class = _terminal_status(action)
+        evidence_required = next_node.get("evidence_required", [])
+        evidence_email = next_node.get("evidence_email")
+    return {
+        "next_node_id":      next_node_id,
+        "previous_node_id":  previous_node_id,
+        "next_node":         {"node_id": next_node_id, **next_node},
+        "answer_key":        answer_key,
+        "is_terminal":       is_terminal,
+        "terminal_class":    terminal_class,
+        "evidence_required": evidence_required,
+        "evidence_email":    evidence_email,
+    }
+
+
 def _terminal_status(action: str) -> str:
     """Map a terminal node's action to the corresponding ticket status.
 
@@ -215,7 +309,42 @@ class WarrantyEngine:
                 collected_data="{}",
             )
             db.add(ticket)
+            db.flush()
+            from warranty_consent import attach_consent_to_ticket  # noqa: WPS433
+
+            attach_consent_to_ticket(db, session_id, ticket)
         return ticket_id, _node_view(_ROOT)
+
+    _QUICK_START_ISSUES = frozenset({"installation", "delivery", "defect"})
+
+    @staticmethod
+    def advance_to_issue_type(ticket_id: str, issue_type: str) -> dict:
+        """
+        Skip the root and issue_type menus and land on the issue entry node.
+
+        Used by the phone IVR (defect-only after hours) and mirrors web
+        quick-start: warranty → installation | delivery | defect.
+        """
+        issue_type = (issue_type or "").strip().lower()
+        if issue_type not in WarrantyEngine._QUICK_START_ISSUES:
+            raise ValueError(
+                f"issue_type must be one of: {sorted(WarrantyEngine._QUICK_START_ISSUES)}"
+            )
+
+        node = WarrantyEngine.get_current_node(ticket_id)
+        if node is None:
+            raise ValueError(f"Ticket {ticket_id!r} not found.")
+
+        node_id = node.get("node_id")
+        if node_id == "root":
+            WarrantyEngine.submit_answer(ticket_id, "warranty")
+            return WarrantyEngine.submit_answer(ticket_id, issue_type)
+        if node_id == "issue_type":
+            return WarrantyEngine.submit_answer(ticket_id, issue_type)
+
+        raise ValueError(
+            f"Cannot advance to {issue_type!r} from node {node_id!r}."
+        )
 
     # ------------------------------------------------------------------
     # Read current state
@@ -233,10 +362,7 @@ class WarrantyEngine:
             if not ticket:
                 return None
             node_id = ticket.current_node_id
-        node = _NODES.get(node_id)
-        if node is None:
-            return None
-        return {"node_id": node_id, **node}
+        return _resolve_node(node_id, ticket)
 
     @staticmethod
     def get_ticket(ticket_id: str) -> Optional[WarrantyTicket]:
@@ -281,6 +407,41 @@ class WarrantyEngine:
             )
 
     @staticmethod
+    def set_model_name(ticket_id: str, model_name: str) -> None:
+        """Persist a chair model and invalidate context from a superseded model."""
+        display = (model_name or "").strip()
+        if not display:
+            raise ValueError("model_name must not be empty")
+        with warranty_db_session() as db:
+            ticket = (
+                db.query(WarrantyTicket)
+                .filter(WarrantyTicket.ticket_id == ticket_id)
+                .first()
+            )
+            if ticket is None:
+                raise ValueError(f"Ticket {ticket_id!r} not found.")
+            previous_model = str(ticket.model_name or "").strip()
+            if previous_model:
+                from warranty_intake_context import reconcile_model_change  # noqa: WPS433
+
+                reconcile_model_change(ticket, previous_model, display)
+            ticket.model_name = display
+            ticket.set_collected("model_name", display)
+
+    @staticmethod
+    def persist_collected_data(ticket_id: str, collected_data: str) -> None:
+        """Persist collected context from a detached ticket returned by get_ticket()."""
+        with warranty_db_session() as db:
+            ticket = (
+                db.query(WarrantyTicket)
+                .filter(WarrantyTicket.ticket_id == ticket_id)
+                .first()
+            )
+            if ticket is None:
+                raise ValueError(f"Ticket {ticket_id!r} not found.")
+            ticket.collected_data = str(collected_data or "{}")
+
+    @staticmethod
     def get_active_session_ticket(session_id: str) -> Optional[WarrantyTicket]:
         """Return the most recent in-progress ticket for a chat session, or None."""
         with warranty_db_session() as db:
@@ -295,19 +456,63 @@ class WarrantyEngine:
             )
 
     @staticmethod
+    def abandon_session_tickets(session_id: str) -> int:
+        """
+        Close any open (non-resolved) tickets for a session so the customer can
+        start fresh with a "Start over" action.
+
+        Tickets that have already been reviewed/resolved by the admin are left
+        untouched. Tickets currently in_progress, awaiting_admin_review,
+        awaiting_evidence, or send_info are marked resolved with
+        admin_decision='abandoned' so they drop out of the active queue but
+        stay queryable for audit.
+
+        Returns the number of tickets that were closed.
+        """
+        closed_statuses = {
+            "in_progress",
+            "awaiting_admin_review",
+            "awaiting_evidence",
+            "send_info",
+            "sales_handoff",
+            "admin_reviewing",
+            "need_more_information",
+        }
+        closed_count = 0
+        with warranty_db_session() as db:
+            tickets = (
+                db.query(WarrantyTicket)
+                .filter(WarrantyTicket.session_id == session_id)
+                .all()
+            )
+            for ticket in tickets:
+                if str(ticket.status or "") in closed_statuses:
+                    ticket.status = "resolved"
+                    ticket.admin_decision = "abandoned"
+                    if not ticket.decided_by:
+                        ticket.decided_by = "customer_restart"
+                    closed_count += 1
+        return closed_count
+
+    @staticmethod
     def get_tickets(
         status: Optional[str] = None,
         domain: Optional[str] = None,
+        channel: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[WarrantyTicket]:
-        """List tickets filtered by status and/or domain."""
+        """List tickets filtered by status, domain, and/or intake channel."""
         with warranty_db_session() as db:
             q = db.query(WarrantyTicket)
             if status:
                 q = q.filter(WarrantyTicket.status == status)
             if domain:
                 q = q.filter(WarrantyTicket.domain.contains(domain))
+            if channel == "phone":
+                q = q.filter(WarrantyTicket.collected_data.like('%"channel": "phone"%'))
+            elif channel == "web":
+                q = q.filter(~WarrantyTicket.collected_data.like('%"channel": "phone"%'))
             return (
                 q.order_by(WarrantyTicket.created_at.desc())
                 .limit(limit)
@@ -320,7 +525,12 @@ class WarrantyEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def submit_answer(ticket_id: str, raw_answer: str) -> dict:
+    def submit_answer(
+        ticket_id: str,
+        raw_answer: str,
+        *,
+        customer_display: Optional[str] = None,
+    ) -> dict:
         """
         Process the customer's answer for the current node and transition state.
 
@@ -329,6 +539,8 @@ class WarrantyEngine:
         ticket_id  : UUID string for the open ticket
         raw_answer : Customer's raw input — either an answer_key, label text,
                      or 1-based integer index string.
+        customer_display : Optional verbatim text to store on the turn (e.g. when
+                     NLP mapped natural language to an answer_key).
 
         Returns
         -------
@@ -354,7 +566,7 @@ class WarrantyEngine:
                 )
 
             node_id = ticket.current_node_id
-            node = _NODES.get(node_id)
+            node = _resolve_node(node_id, ticket)
             if node is None:
                 raise ValueError(
                     f"Flowchart node {node_id!r} not found. "
@@ -369,6 +581,219 @@ class WarrantyEngine:
                 )
 
             # -----------------------------------------------------------
+            # Virtual error-code gate (engine intercept)
+            # -----------------------------------------------------------
+            if is_gate_node(node_id):
+                pending_id = str(ticket.get_collected().get(COL_PENDING_TERMINAL) or "")
+                if not pending_id or pending_id not in _NODES:
+                    raise ValueError(
+                        "Error-code gate state is invalid — please contact support."
+                    )
+
+                if node_id == GATE_VISIBLE_ID:
+                    from error_code_lookup import extract_error_codes_from_text  # noqa: WPS433
+                    from warranty_error_code_gate import map_gate_free_text  # noqa: WPS433
+
+                    display = (
+                        customer_display if customer_display is not None else raw_answer
+                    )
+                    mapped_key = map_gate_free_text(node_id, display)
+                    options = node.get("options", [])
+                    if mapped_key:
+                        matched = next(
+                            (o for o in options if o.get("answer_key") == mapped_key),
+                            None,
+                        )
+                    else:
+                        matched = _match_option(options, raw_answer)
+                    if matched is None:
+                        valid_keys = [
+                            o.get("answer_key", o.get("label")) for o in options
+                        ]
+                        raise ValueError(
+                            f"Answer {raw_answer!r} did not match any option at node "
+                            f"{node_id!r}. Valid answer_keys: {valid_keys}"
+                        )
+                    answer_key = str(matched.get("answer_key") or raw_answer)
+                    turn = WarrantyTurn(
+                        ticket_id=ticket_id,
+                        node_id=node_id,
+                        node_type=node_type,
+                        node_prompt=node.get("prompt", ""),
+                        customer_answer=(
+                            customer_display if customer_display is not None else raw_answer
+                        ),
+                        answer_key=answer_key,
+                    )
+                    db.add(turn)
+
+                    if answer_key == "error_code_yes":
+                        from error_code_lookup import extract_error_codes_from_text  # noqa: WPS433
+
+                        display = (
+                            customer_display if customer_display is not None else raw_answer
+                        )
+                        codes = extract_error_codes_from_text(display)
+                        if codes:
+                            finalize_error_code_submission(ticket, codes[0])
+                            ticket.set_collected(COL_GATE_COMPLETED, "entered")
+                            pending_node = _apply_pending_terminal(ticket, pending_id)
+                            ticket.set_collected(COL_PENDING_TERMINAL, "")
+                            return _build_submit_result(
+                                next_node_id=pending_id,
+                                previous_node_id=node_id,
+                                next_node=pending_node,
+                                answer_key=answer_key,
+                            )
+
+                        ticket.current_node_id = GATE_PICK_ID
+                        next_node = resolve_gate_node(GATE_PICK_ID, ticket) or {}
+                        return _build_submit_result(
+                            next_node_id=GATE_PICK_ID,
+                            previous_node_id=node_id,
+                            next_node=next_node,
+                            answer_key=answer_key,
+                        )
+
+                    ticket.set_collected(COL_GATE_COMPLETED, "skipped")
+                    pending_node = _apply_pending_terminal(ticket, pending_id)
+                    ticket.set_collected(COL_PENDING_TERMINAL, "")
+                    return _build_submit_result(
+                        next_node_id=pending_id,
+                        previous_node_id=node_id,
+                        next_node=pending_node,
+                        answer_key=answer_key,
+                    )
+
+                if node_id == GATE_PICK_ID:
+                    from error_code_lookup import parse_pick_answer_key  # noqa: WPS433
+                    from warranty_error_code_gate import map_gate_free_text  # noqa: WPS433
+
+                    display = (
+                        customer_display if customer_display is not None else raw_answer
+                    )
+                    mapped_key = map_gate_free_text(node_id, display)
+                    if mapped_key == "error_code_other":
+                        ticket.current_node_id = GATE_ENTER_ID
+                        next_node = resolve_gate_node(GATE_ENTER_ID, ticket) or {}
+                        turn = WarrantyTurn(
+                            ticket_id=ticket_id,
+                            node_id=node_id,
+                            node_type=node_type,
+                            node_prompt=node.get("prompt", ""),
+                            customer_answer=display,
+                            answer_key="error_code_other",
+                        )
+                        db.add(turn)
+                        return _build_submit_result(
+                            next_node_id=GATE_ENTER_ID,
+                            previous_node_id=node_id,
+                            next_node=next_node,
+                            answer_key="error_code_other",
+                        )
+
+                    if mapped_key and mapped_key.startswith("pick_"):
+                        answer_key = mapped_key
+                        turn = WarrantyTurn(
+                            ticket_id=ticket_id,
+                            node_id=node_id,
+                            node_type=node_type,
+                            node_prompt=node.get("prompt", ""),
+                            customer_answer=display,
+                            answer_key=answer_key,
+                        )
+                        db.add(turn)
+                        picked_code = parse_pick_answer_key(answer_key)
+                        if not picked_code:
+                            raise ValueError(
+                                f"Could not parse error code from answer_key {answer_key!r}."
+                            )
+                        finalize_error_code_submission(ticket, picked_code)
+                        ticket.set_collected(COL_GATE_COMPLETED, "picked")
+                        pending_node = _apply_pending_terminal(ticket, pending_id)
+                        ticket.set_collected(COL_PENDING_TERMINAL, "")
+                        return _build_submit_result(
+                            next_node_id=pending_id,
+                            previous_node_id=node_id,
+                            next_node=pending_node,
+                            answer_key=answer_key,
+                        )
+
+                    options = node.get("options", [])
+                    matched = _match_option(options, raw_answer)
+                    if matched is None:
+                        valid_keys = [
+                            o.get("answer_key", o.get("label")) for o in options
+                        ]
+                        raise ValueError(
+                            f"Answer {raw_answer!r} did not match any option at node "
+                            f"{node_id!r}. Valid answer_keys: {valid_keys}"
+                        )
+                    answer_key = str(matched.get("answer_key") or raw_answer)
+                    turn = WarrantyTurn(
+                        ticket_id=ticket_id,
+                        node_id=node_id,
+                        node_type=node_type,
+                        node_prompt=node.get("prompt", ""),
+                        customer_answer=(
+                            customer_display if customer_display is not None else raw_answer
+                        ),
+                        answer_key=answer_key,
+                    )
+                    db.add(turn)
+
+                    if answer_key == "error_code_other":
+                        ticket.current_node_id = GATE_ENTER_ID
+                        next_node = resolve_gate_node(GATE_ENTER_ID, ticket) or {}
+                        return _build_submit_result(
+                            next_node_id=GATE_ENTER_ID,
+                            previous_node_id=node_id,
+                            next_node=next_node,
+                            answer_key=answer_key,
+                        )
+
+                    picked_code = parse_pick_answer_key(answer_key)
+                    if not picked_code:
+                        raise ValueError(
+                            f"Could not parse error code from answer_key {answer_key!r}."
+                        )
+                    finalize_error_code_submission(ticket, picked_code)
+                    ticket.set_collected(COL_GATE_COMPLETED, "picked")
+                    pending_node = _apply_pending_terminal(ticket, pending_id)
+                    ticket.set_collected(COL_PENDING_TERMINAL, "")
+                    return _build_submit_result(
+                        next_node_id=pending_id,
+                        previous_node_id=node_id,
+                        next_node=pending_node,
+                        answer_key=answer_key,
+                    )
+
+                if node_id == GATE_ENTER_ID:
+                    text = (
+                        customer_display if customer_display is not None else raw_answer
+                    ).strip()
+                    finalize_error_code_submission(ticket, text)
+
+                    turn = WarrantyTurn(
+                        ticket_id=ticket_id,
+                        node_id=node_id,
+                        node_type=node_type,
+                        node_prompt=node.get("prompt", ""),
+                        customer_answer=text,
+                        answer_key=COL_ERROR_CODE,
+                    )
+                    db.add(turn)
+                    ticket.set_collected(COL_GATE_COMPLETED, "entered")
+                    pending_node = _apply_pending_terminal(ticket, pending_id)
+                    ticket.set_collected(COL_PENDING_TERMINAL, "")
+                    return _build_submit_result(
+                        next_node_id=pending_id,
+                        previous_node_id=node_id,
+                        next_node=pending_node,
+                        answer_key=COL_ERROR_CODE,
+                    )
+
+            # -----------------------------------------------------------
             # Determine the next node
             # -----------------------------------------------------------
             if node_type == "question_text":
@@ -376,6 +801,11 @@ class WarrantyEngine:
                 answer_key = node.get("answer_key", "text_input")
                 # Store free-text input in collected_data
                 ticket.set_collected(answer_key, raw_answer)
+                from warranty_email import extract_email  # noqa: WPS433
+
+                detected = extract_email(raw_answer)
+                if detected:
+                    ticket.set_collected("customer_contact_email", detected)
             else:
                 # question or instruction: match to an option
                 options = node.get("options", [])
@@ -397,7 +827,7 @@ class WarrantyEngine:
                 node_id=node_id,
                 node_type=node_type,
                 node_prompt=node.get("prompt", ""),
-                customer_answer=raw_answer,
+                customer_answer=customer_display if customer_display is not None else raw_answer,
                 answer_key=answer_key,
             )
             db.add(turn)
@@ -410,37 +840,130 @@ class WarrantyEngine:
             elif node_id == "defect_problem_type":
                 ticket.defect_type = answer_key
             elif node_id == "install_model":
-                ticket.model_name = raw_answer
+                from product_catalog import resolve_model_name  # noqa: WPS433
+
+                display = customer_display if customer_display is not None else raw_answer
+                ticket.model_name = resolve_model_name(display) or display
 
             # -----------------------------------------------------------
-            # Transition to next node
+            # Transition to next node (optional error-code gate intercept)
             # -----------------------------------------------------------
             next_node = _NODES[next_node_id]
-            is_terminal = next_node.get("type") == "terminal"
-
-            ticket.current_node_id = next_node_id
-            if is_terminal:
-                ticket.status = _terminal_status(next_node.get("action", "awaiting_admin"))
+            gate_id = intercept_terminal_node_id(ticket, next_node_id)
+            if gate_id and next_node.get("type") == "terminal":
+                ticket.set_collected(COL_PENDING_TERMINAL, next_node_id)
+                next_node_id = gate_id
+                next_node = resolve_gate_node(gate_id, ticket) or {}
+                is_terminal = False
+                ticket.current_node_id = next_node_id
+            else:
+                is_terminal = next_node.get("type") == "terminal"
+                ticket.current_node_id = next_node_id
+                if is_terminal:
+                    ticket.status = _terminal_status(next_node.get("action", "awaiting_admin"))
 
         # Build result (outside session — ticket is detached but expire_on_commit=False)
-        evidence_required: list[str] = []
-        evidence_email: Optional[str] = None
-        terminal_class: Optional[str] = None
         if is_terminal:
-            action = next_node.get("action", "awaiting_admin")
-            terminal_class = _terminal_status(action)
-            evidence_required = next_node.get("evidence_required", [])
-            evidence_email = next_node.get("evidence_email")
+            return _build_submit_result(
+                next_node_id=next_node_id,
+                previous_node_id=node_id,
+                next_node=next_node,
+                answer_key=answer_key,
+            )
+        return _build_submit_result(
+            next_node_id=next_node_id,
+            previous_node_id=node_id,
+            next_node=next_node,
+            answer_key=answer_key,
+        )
 
+    @staticmethod
+    def can_go_back(ticket_id: str) -> bool:
+        """True when the ticket is in progress and at least one turn can be undone."""
+        ticket = WarrantyEngine.get_ticket(ticket_id)
+        if ticket is None or str(ticket.status) != "in_progress":
+            return False
+        return len(WarrantyEngine.get_turns(ticket_id)) >= 1
+
+    @staticmethod
+    def go_back(ticket_id: str) -> dict:
+        """
+        Undo the last customer answer by dropping the most recent turn and
+        replaying the remaining turns so ``current_node_id`` and
+        ``collected_data`` stay aligned with the flowchart.
+        """
+        ticket = WarrantyEngine.get_ticket(ticket_id)
+        if ticket is None:
+            raise ValueError(f"Ticket {ticket_id!r} not found.")
+        if str(ticket.status) != "in_progress":
+            raise ValueError(
+                f"Cannot go back — ticket status is {ticket.status!r}."
+            )
+
+        with warranty_db_session() as db:
+            ticket = (
+                db.query(WarrantyTicket)
+                .filter(WarrantyTicket.ticket_id == ticket_id)
+                .first()
+            )
+            if ticket is None:
+                raise ValueError(f"Ticket {ticket_id!r} not found.")
+
+            turns = (
+                db.query(WarrantyTurn)
+                .filter(WarrantyTurn.ticket_id == ticket_id)
+                .order_by(WarrantyTurn.id.asc())
+                .all()
+            )
+            if not turns:
+                raise ValueError("Nothing to go back to.")
+
+            model_name = str(ticket.model_name or "")
+            preserved: dict[str, str] = {}
+            collected = ticket.get_collected()
+            for key in _REWIND_PRESERVE_COLLECTED:
+                val = collected.get(key)
+                if val:
+                    preserved[key] = str(val)
+
+            replay = list(turns[:-1])
+            for turn in turns:
+                db.delete(turn)
+
+            ticket.status = "in_progress"
+            ticket.current_node_id = _ROOT
+            ticket.issue_type = None
+            ticket.defect_type = None
+            ticket.collected_data = "{}"
+            for key, val in preserved.items():
+                ticket.set_collected(key, val)
+            if model_name:
+                ticket.model_name = model_name
+                ticket.set_collected("model_name", model_name)
+
+        for turn in replay:
+            raw, display = _replay_turn_answer(turn)
+            WarrantyEngine.submit_answer(
+                ticket_id,
+                raw,
+                customer_display=display,
+            )
+
+        ticket = WarrantyEngine.get_ticket(ticket_id)
+        if (
+            ticket is not None
+            and str(ticket.current_node_id) == _ROOT
+            and model_name.strip()
+        ):
+            WarrantyEngine.submit_answer(ticket_id, "warranty")
+
+        node = WarrantyEngine.get_current_node(ticket_id)
+        restored_id = str(node.get("node_id", "")) if node else ""
+        turn_count = len(WarrantyEngine.get_turns(ticket_id))
         return {
-            "next_node_id":      next_node_id,
-            "previous_node_id":  node_id,
-            "next_node":         {"node_id": next_node_id, **next_node},
-            "answer_key":        answer_key,
-            "is_terminal":       is_terminal,
-            "terminal_class":    terminal_class,
-            "evidence_required": evidence_required,
-            "evidence_email":    evidence_email,
+            "restored_node_id": restored_id,
+            "turn_count": turn_count,
+            "can_go_back": turn_count >= 1,
         }
 
     # ------------------------------------------------------------------
@@ -529,6 +1052,7 @@ class WarrantyEngine:
         original_filename: str = "",
         mime_type: str = "",
         file_size_bytes: int = 0,
+        customer_email: str = "",
     ) -> WarrantyEvidence:
         """
         Persist an evidence record for a ticket.
@@ -547,6 +1071,15 @@ class WarrantyEngine:
             if not ticket:
                 raise ValueError(f"Ticket {ticket_id!r} not found.")
 
+            normalized_email = ""
+            if customer_email:
+                from warranty_email import extract_email  # noqa: WPS433
+
+                normalized = extract_email(customer_email)
+                if normalized:
+                    normalized_email = normalized
+                    ticket.set_collected("customer_contact_email", normalized)
+
             ev = WarrantyEvidence(
                 ticket_id=ticket_id,
                 evidence_type=evidence_type,
@@ -554,6 +1087,7 @@ class WarrantyEngine:
                 original_filename=original_filename,
                 mime_type=mime_type,
                 file_size_bytes=file_size_bytes,
+                customer_email=normalized_email or None,
                 emailed=0,
             )
             db.add(ev)

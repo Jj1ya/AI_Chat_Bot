@@ -170,6 +170,38 @@ class TestEvidenceUploadEndpoint:
         body = response.json()
         assert body["original_filename"] == "receipt.pdf"
 
+    def test_webp_upload_accepted(self, client):
+        ticket_id = _make_ticket("webp-test")
+        webp_data = b"RIFF" + b"\x00" * 4 + b"WEBP"
+
+        response = client.post(
+            f"/api/v1/warranty/{ticket_id}/evidence",
+            data=_upload_form("photo_of_defect"),
+            files={"file": ("defect.webp", io.BytesIO(webp_data), "image/webp")},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["original_filename"] == "defect.webp"
+        assert "saved_path" not in body
+
+    @pytest.mark.parametrize(
+        ("filename", "content_type", "payload"),
+        [
+            ("issue.avi", "video/x-msvideo", b"RIFF" + b"\x00" * 4 + b"AVI " + b"\x00" * 8),
+            ("issue.webm", "video/webm", b"\x1aE\xdf\xa3" + b"\x00" * 16),
+        ],
+    )
+    def test_advertised_video_formats_are_accepted(
+        self, client, filename, content_type, payload
+    ):
+        ticket_id = _make_ticket(f"video-{filename}")
+        response = client.post(
+            f"/api/v1/warranty/{ticket_id}/evidence",
+            data=_upload_form("video_of_issue"),
+            files={"file": (filename, io.BytesIO(payload), content_type)},
+        )
+        assert response.status_code == 200, response.text
+
     def test_invalid_extension_rejected(self, client):
         """Uploading a .exe file is rejected with HTTP 422."""
         ticket_id = _make_ticket("ext-test")
@@ -193,6 +225,16 @@ class TestEvidenceUploadEndpoint:
         )
         assert response.status_code == 422
 
+    def test_spoofed_file_contents_rejected_and_deleted(self, client, tmp_path):
+        ticket_id = _make_ticket("spoof-test")
+        response = client.post(
+            f"/api/v1/warranty/{ticket_id}/evidence",
+            data=_upload_form("damage_photos"),
+            files={"file": ("fake.jpg", io.BytesIO(b"not-a-jpeg"), "image/jpeg")},
+        )
+        assert response.status_code == 422
+        assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
     def test_unsafe_filename_path_traversal_sanitised(self, client, tmp_path):
         """
         A filename like '../../etc/passwd.jpg' must be sanitised before saving.
@@ -210,12 +252,16 @@ class TestEvidenceUploadEndpoint:
         # Should succeed (sanitisation, not rejection)
         assert response.status_code == 200, response.text
         body = response.json()
-        saved_path = Path(body["saved_path"])
-        # Verify the saved path is inside tmp_path (the mocked _UPLOAD_ROOT)
+        assert "saved_path" not in body
+
+        from warranty_workflow import WarrantyEngine
+
+        evidences = WarrantyEngine.get_evidences(ticket_id)
+        assert len(evidences) == 1
+        saved_path = Path(str(evidences[0].file_path))
         assert str(saved_path).startswith(str(tmp_path)), (
             f"File was saved outside upload root! saved_path={saved_path}"
         )
-        # The filename must NOT contain '..' components
         assert ".." not in saved_path.parts, (
             f"Saved path contains '..' components: {saved_path}"
         )
@@ -240,6 +286,11 @@ class TestEvidenceUploadEndpoint:
         assert str(ev.original_filename) == "defect.jpg"
         assert str(ev.file_path) != ""     # path was stored
         assert Path(str(ev.file_path)).exists()  # file actually exists on disk
+
+        ticket = WarrantyEngine.get_ticket(ticket_id)
+        assert ticket is not None
+        assert ticket.get_collected().get("customer_contact_email") == _CUSTOMER_EMAIL
+        assert str(evidences[0].customer_email) == _CUSTOMER_EMAIL
 
     def test_no_email_sent_when_notification_disabled(self, client):
         """When notification is blocked, emailed flag stays 0."""
@@ -279,7 +330,7 @@ class TestEvidenceUploadEndpoint:
             files={"file": ("img.jpg", io.BytesIO(jpg_data), "image/jpeg")},
         )
         assert response.status_code == 200, response.text
-        assert response.json()["customer_email"] == "buyer@example.com"
+        assert response.json()["customer_email"] == "b***r@example.com"
         assert len(calls) == 1
         assert calls[0]["customer_email"] == "buyer@example.com"
         assert calls[0]["ticket_id"] == ticket_id
@@ -336,7 +387,7 @@ class TestEvidenceUploadEndpoint:
             client.post(
                 f"/api/v1/warranty/{ticket_id}/evidence",
                 data=_upload_form("damage_photos"),
-                files={"file": (f"img{i}.jpg", io.BytesIO(b"\xff\xd8" + b"\x00" * 10), "image/jpeg")},
+            files={"file": (f"img{i}.jpg", io.BytesIO(b"\xff\xd8\xff" + b"\x00" * 10), "image/jpeg")},
             )
 
         response = client.get(f"/api/v1/warranty/{ticket_id}/evidence")
@@ -350,8 +401,8 @@ class TestEvidenceUploadEndpoint:
         ticket_id = _make_ticket("multi-test")
 
         files = [
-            ("photo1.jpg", b"\xff\xd8" + b"\x00" * 10, "image/jpeg", "damage_photos"),
-            ("receipt.pdf", b"%PDF" + b"\x00" * 10, "application/pdf", "proof_of_purchase"),
+            ("photo1.jpg", b"\xff\xd8\xff" + b"\x00" * 10, "image/jpeg", "damage_photos"),
+            ("receipt.pdf", b"%PDF-" + b"\x00" * 10, "application/pdf", "proof_of_purchase"),
         ]
         ids = []
         for fname, data, mime, ev_type in files:
@@ -365,3 +416,113 @@ class TestEvidenceUploadEndpoint:
 
         # Each upload gets a distinct DB ID
         assert len(set(ids)) == len(ids), "Duplicate evidence IDs returned"
+
+
+class TestWarrantyContactEndpoint:
+    """HTTP-level tests for POST /api/v1/warranty/{ticket_id}/contact (email-only / N/A)."""
+
+    def _terminal_ticket(self) -> str:
+        from warranty_workflow import WarrantyEngine
+
+        ticket_id, _ = WarrantyEngine.start_session("contact-test", "test.com")
+        WarrantyEngine.submit_answer(ticket_id, "warranty")
+        WarrantyEngine.submit_answer(ticket_id, "installation")
+        WarrantyEngine.submit_answer(ticket_id, "OS-4000T")
+        WarrantyEngine.submit_answer(ticket_id, "footrest_or_no_air")
+        return ticket_id
+
+    def test_email_only_contact_on_terminal(self, client, monkeypatch):
+        from warranty_workflow import WarrantyEngine
+
+        transcript_calls = []
+        notify_calls = []
+        monkeypatch.setattr(
+            "warranty_email.send_warranty_transcript_email",
+            lambda **kwargs: transcript_calls.append(kwargs) or True,
+        )
+        monkeypatch.setattr(
+            "warranty_email.notify_email_only_contact_async",
+            lambda **kwargs: notify_calls.append(kwargs),
+        )
+        monkeypatch.setattr(
+            "warranty_email.send_customer_receipt_email",
+            lambda **_k: False,
+        )
+
+        ticket_id = self._terminal_ticket()
+        response = client.post(
+            f"/api/v1/warranty/{ticket_id}/contact",
+            json={"customer_email": "buyer@example.com", "evidence_na": True},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["customer_email"] == "b***r@example.com"
+        assert body["evidence_type"] == "not_available"
+        assert body["evidence_na"] is True
+        assert "case_summary" in body
+        assert body["case_summary_source"] in {"llm", "deterministic"}
+
+        evidences = WarrantyEngine.get_evidences(ticket_id)
+        assert len(evidences) == 1
+        assert str(evidences[0].evidence_type) == "not_available"
+        assert str(evidences[0].original_filename) == "N/A"
+        assert str(evidences[0].customer_email) == "buyer@example.com"
+
+        ticket = WarrantyEngine.get_ticket(ticket_id)
+        assert ticket is not None
+        assert ticket.get_collected().get("customer_contact_email") == "buyer@example.com"
+        assert ticket.get_collected().get("evidence_na") == "1"
+        assert len(transcript_calls) == 1
+        assert len(notify_calls) == 1
+        assert str(body.get("case_reference") or "").startswith("WR-")
+
+    def test_email_only_contact_sends_customer_receipt(self, client, monkeypatch):
+        receipt_calls = []
+        monkeypatch.setattr(
+            "warranty_email.send_warranty_transcript_email",
+            lambda **_k: True,
+        )
+        monkeypatch.setattr(
+            "warranty_email.notify_email_only_contact_async",
+            lambda **_k: None,
+        )
+        monkeypatch.setattr(
+            "warranty_email.send_customer_receipt_email",
+            lambda **kwargs: receipt_calls.append(kwargs) or True,
+        )
+        monkeypatch.setattr("warranty_email.EMAIL_SENDER", "bot@example.com")
+        monkeypatch.setattr("warranty_email.EMAIL_PASSWORD", "secret")
+
+        ticket_id = self._terminal_ticket()
+        response = client.post(
+            f"/api/v1/warranty/{ticket_id}/contact",
+            json={"customer_email": "buyer@example.com", "evidence_na": True},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["receipt_email_sent"] is True
+        assert body["case_reference"].startswith("WR-")
+        assert len(receipt_calls) == 1
+        assert receipt_calls[0]["to_email"] == "buyer@example.com"
+        assert receipt_calls[0]["case_reference"].startswith("WR-")
+
+    def test_contact_rejected_before_terminal(self, client):
+        from warranty_workflow import WarrantyEngine
+
+        ticket_id, _ = WarrantyEngine.start_session("contact-early", "test.com")
+        WarrantyEngine.submit_answer(ticket_id, "warranty")
+        WarrantyEngine.submit_answer(ticket_id, "defect")
+
+        response = client.post(
+            f"/api/v1/warranty/{ticket_id}/contact",
+            json={"customer_email": "buyer@example.com", "evidence_na": True},
+        )
+        assert response.status_code == 422
+
+    def test_contact_invalid_email_rejected(self, client):
+        ticket_id = self._terminal_ticket()
+        response = client.post(
+            f"/api/v1/warranty/{ticket_id}/contact",
+            json={"customer_email": "not-an-email", "evidence_na": True},
+        )
+        assert response.status_code == 422

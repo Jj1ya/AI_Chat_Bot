@@ -5,16 +5,31 @@ Warranty Delivery flow — live tracking lookup (no LLM).
 
 Supports either:
   - Tracking number  → Track123 (+ AfterShip fallback)
-  - Order # OR email → Shopify (+ Track123 enrich inside fetch_shopify_order_status)
+  - Checkout email (or order number + email) → Shopify (+ Track123 enrich)
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+from store_config import get_order_tracking_page_url
+
+_CARRIER_TRACKING_URLS = {
+    "ups": "https://www.ups.com/track?tracknum={tn}",
+    "fedex": "https://www.fedex.com/fedextrack/?trknbr={tn}",
+    "usps": "https://tools.usps.com/go/TrackConfirmAction?tLabels={tn}",
+    "dhl": "https://www.dhl.com/global-en/home/tracking/tracking-express.html?submit=1&tracking-id={tn}",
+    "ontrac": "https://www.ontrac.com/tracking/?number={tn}",
+    "lasership": "https://www.lasership.com/track/{tn}",
+    "amazon": "https://track.amazon.com/tracking/{tn}",
+}
 
 
 @dataclass
@@ -147,16 +162,114 @@ def _snapshot_from_tracking_data(
 
 
 def parse_order_or_email(raw: str) -> tuple[str, str]:
-    """Split customer input into (order_number, email). Either may be empty."""
+    """Split customer input into (order_number, email). Either may be empty.
+
+    Prefer extracting an embedded email first so customers can paste
+    ``#12345 you@example.com`` and we keep both for a privacy-safe lookup.
+    Also accepts wordy pastes like ``order 12345 email buyer@example.com``.
+    """
+    from delivery_intake import is_plausible_email, is_plausible_order_id  # noqa: WPS433
+    from warranty_email import extract_email  # noqa: WPS433
+
     text = (raw or "").strip()
     if not text:
         return "", ""
-    if "@" in text:
-        return "", text
-    clean = text.replace("#", "").strip()
-    if re.fullmatch(r"[\w.+-]+@[\w.-]+\.\w+", text):
-        return "", text
-    return clean, ""
+
+    email = extract_email(text) or ""
+    if not email and is_plausible_email(text):
+        email = text
+
+    remainder = text
+    if email:
+        remainder = text.replace(email, " ").strip()
+
+    # Strip common labels so "order: OSK123" / "email buyer@…" still parse.
+    remainder = re.sub(
+        r"\b(order(\s*(number|id|#))?|ord(\s*#)?|email|e-mail|checkout\s*email)\b[:#]?",
+        " ",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    remainder = remainder.strip(" ,;/|-")
+
+    order = ""
+    if remainder:
+        clean = remainder.replace("#", "").strip()
+        # Prefer a contiguous order-looking token.
+        for token in re.split(r"[\s,;/|]+", clean):
+            token = token.strip()
+            if token and is_plausible_order_id(token):
+                order = token
+                break
+        if not order and is_plausible_order_id(clean):
+            order = clean
+
+    if not order and not email and is_plausible_order_id(text.replace("#", "").strip()):
+        order = text.replace("#", "").strip()
+
+    return order, email
+
+
+def admin_lookup_failure_reason(error: Optional[str]) -> str:
+    """Short internal label for failed delivery lookups (never invent customer copy)."""
+    code = (error or "").strip()
+    if not code:
+        return "unknown"
+    mapping = {
+        "order_lookup_failed": "Shopify/order lookup failed (API error)",
+        "carrier_lookup_failed": "Carrier lookup failed (API error)",
+    }
+    if code in mapping:
+        return mapping[code]
+    lower = code.lower()
+    if lower.startswith(("please", "for your privacy", "we could not verify")):
+        return code
+    return code[:120]
+
+
+def lookup_by_order_or_email(raw: str, domain: str) -> TrackingSnapshot:
+    """Shopify order lookup — email required when looking up by order number."""
+    order, email = parse_order_or_email(raw)
+    if not order and not email:
+        return TrackingSnapshot(
+            source="unavailable",
+            available=False,
+            error="Please provide your checkout email, or your order number together with that email.",
+            looked_up_at=_now_iso(),
+        )
+    if order and not email:
+        return TrackingSnapshot(
+            source="unavailable",
+            available=False,
+            error=(
+                "For your privacy, we need the checkout email along with your order number. "
+                "Please reply with both (for example: #12345 you@example.com)."
+            ),
+            looked_up_at=_now_iso(),
+        )
+
+    logistics = _lazy_logistics()
+    fetch = logistics.fetch_shopify_order_status
+    try:
+        data = fetch(order, email, domain, allow_order_only=False)
+    except TypeError:
+        # Older / test stubs without the privacy kwarg.
+        data = fetch(order, email, domain)
+    return _snapshot_from_tracking_data(data, source="shopify")
+
+
+def public_tracking_summary_payload(
+    *,
+    available: bool,
+    message: str,
+    self_service_links: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    """Browser-safe tracking payload — message + links only (no raw snapshot PII)."""
+    return {
+        "available": available,
+        "message": message,
+        "self_service_links": self_service_links,
+    }
 
 
 def lookup_by_tracking_number(tracking_number: str, domain: str) -> TrackingSnapshot:
@@ -173,10 +286,13 @@ def lookup_by_tracking_number(tracking_number: str, domain: str) -> TrackingSnap
     logistics = _lazy_logistics()
     store = logistics.get_store_config(domain)
     enriched = logistics.enrich_tracking_from_track123(tn, store)
+    source = "track123"
 
     if not enriched:
         carrier = logistics.resolve_carrier_name("", tn, "")
         enriched = logistics.enrich_tracking_from_aftership(carrier, tn) or {}
+        if enriched:
+            source = "aftership"
 
     if not enriched:
         return TrackingSnapshot(
@@ -189,7 +305,7 @@ def lookup_by_tracking_number(tracking_number: str, domain: str) -> TrackingSnap
 
     data: Dict[str, Any] = {
         "status": enriched.get("status", "IN_TRANSIT"),
-        "company": enriched.get("company", logistics.resolve_carrier_name("", tn, "")),
+        "company": enriched.get("company") or logistics.resolve_carrier_name("", tn, ""),
         "tracking_number": tn,
         "tracking_url": enriched.get("tracking_url", ""),
         "current_location": enriched.get("current_location", "Carrier network"),
@@ -198,35 +314,152 @@ def lookup_by_tracking_number(tracking_number: str, domain: str) -> TrackingSnap
         "last_event": enriched.get("last_event", "Latest carrier update"),
         "events": enriched.get("events", []),
     }
-    snap = _snapshot_from_tracking_data(data, source="track123", tracking_number=tn)
+    snap = _snapshot_from_tracking_data(data, source=source, tracking_number=tn)
     snap.available = True
     return snap
 
 
-def lookup_by_order_or_email(raw: str, domain: str) -> TrackingSnapshot:
-    """Shopify order lookup — order number OR email is enough."""
-    order, email = parse_order_or_email(raw)
-    if not order and not email:
+def safe_lookup_by_order_or_email(raw: str, domain: str) -> TrackingSnapshot:
+    """Lookup that never raises — failed APIs still return a persistable snapshot."""
+    try:
+        return lookup_by_order_or_email(raw, domain)
+    except Exception as exc:
+        logger.warning("Shopify delivery lookup failed: %s", exc)
+        order, email = parse_order_or_email(raw)
         return TrackingSnapshot(
             source="unavailable",
             available=False,
-            error="Please provide your order number or checkout email.",
+            order_number=order,
+            error="order_lookup_failed",
             looked_up_at=_now_iso(),
         )
 
-    logistics = _lazy_logistics()
-    data = logistics.fetch_shopify_order_status(order, email, domain)
-    return _snapshot_from_tracking_data(data, source="shopify")
 
-
-def format_warranty_tracking_message(snapshot: TrackingSnapshot) -> str:
-    """Customer-facing English message for the warranty chat (no sales footer)."""
-    if not snapshot.available:
-        return (
-            "We couldn't verify your delivery details automatically right now. "
-            "Our support team will look this up and follow up with you."
-            + (f"\n\n({snapshot.error})" if snapshot.error else "")
+def safe_lookup_by_tracking_number(tracking_number: str, domain: str) -> TrackingSnapshot:
+    """Lookup that never raises — failed carrier APIs still keep the tracking number."""
+    tn = (tracking_number or "").strip()
+    try:
+        return lookup_by_tracking_number(tn, domain)
+    except Exception as exc:
+        logger.warning("Carrier delivery lookup failed: %s", exc)
+        return TrackingSnapshot(
+            source="unavailable",
+            available=False,
+            tracking_number=tn,
+            error="carrier_lookup_failed",
+            looked_up_at=_now_iso(),
         )
+
+
+_CARRIER_PATTERNS = [
+    (r"^1Z[A-Z0-9]{16}$", "ups"),
+    (r"^9[2-5]\d{20,}$", "usps"),
+    (r"^(94|93|92|95)\d{18,}$", "usps"),
+    (r"^\d{20,22}$", "usps"),
+    (r"^\d{12,15}$", "fedex"),
+    (r"^C\d{8,}$", "ontrac"),
+    (r"^1LS\d+$", "lasership"),
+    (r"^TBA\d+$", "amazon"),
+]
+
+
+def _infer_carrier_slug(tracking_number: str, carrier: str = "") -> str:
+    carrier_lower = (carrier or "").lower()
+    for slug in _CARRIER_TRACKING_URLS:
+        if slug in carrier_lower:
+            return slug
+
+    tn = re.sub(r"\s+", "", (tracking_number or "").strip())
+    for pattern, slug in _CARRIER_PATTERNS:
+        if re.match(pattern, tn, re.IGNORECASE):
+            return slug
+    return ""
+
+
+def build_carrier_tracking_url(tracking_number: str, carrier: str = "") -> str:
+    """Best-effort direct carrier tracking URL when live API lookup fails."""
+    tn = re.sub(r"\s+", "", (tracking_number or "").strip())
+    if not tn:
+        return ""
+
+    slug = _infer_carrier_slug(tn, carrier)
+    template = _CARRIER_TRACKING_URLS.get(slug)
+    if template:
+        return template.format(tn=tn)
+    return ""
+
+
+def build_self_service_lookup_links(
+    *,
+    domain: str,
+    lookup_kind: str,
+    raw_input: str = "",
+) -> List[Tuple[str, str]]:
+    """
+    Return (label, url) pairs the customer can use when automatic lookup fails.
+    """
+    links: List[Tuple[str, str]] = []
+    store_url = get_order_tracking_page_url(domain)
+    if store_url:
+        links.append(("Track on our website", store_url))
+
+    if lookup_kind == "tracking":
+        carrier_url = build_carrier_tracking_url(raw_input)
+        if carrier_url:
+            links.append(("Track with the carrier", carrier_url))
+
+    return links
+
+
+def format_warranty_tracking_message(
+    snapshot: TrackingSnapshot,
+    *,
+    domain: str = "",
+    lookup_kind: str = "",
+    raw_input: str = "",
+    continue_with_questions: bool = True,
+) -> str:
+    """Customer-facing English message for the warranty chat (no sales footer).
+
+    When ``continue_with_questions`` is False (status-only lookup path), close with
+    a follow-up note instead of promising more warranty questions.
+    """
+    closing = (
+        "We'll continue with your delivery warranty questions below."
+        if continue_with_questions
+        else (
+            "That's the latest status we have. "
+            "Our team will follow up shortly if you need more help."
+        )
+    )
+
+    if not snapshot.available:
+        lines = [
+            "We couldn't verify your delivery details automatically right now.",
+            "We saved what you entered, and your case continues.",
+            "Our support team will look this up and follow up with you.",
+        ]
+        saved = snapshot.tracking_number or snapshot.order_number
+        if saved:
+            lines.append(f"Saved for our team: **{saved}**.")
+        error = (snapshot.error or "").strip()
+        if error and error.lower().startswith(
+            ("please", "for your privacy", "we could not verify")
+        ):
+            lines.append(f"\n({error})")
+
+        help_links = build_self_service_lookup_links(
+            domain=domain,
+            lookup_kind=lookup_kind,
+            raw_input=raw_input,
+        )
+        if help_links:
+            lines.append("")
+            lines.append("You can also check directly here:")
+            for label, url in help_links:
+                lines.append(f"- [{label}]({url})")
+
+        return "\n".join(lines)
 
     order_lines = _order_details_lines(snapshot)
 
@@ -239,7 +472,7 @@ def format_warranty_tracking_message(snapshot: TrackingSnapshot) -> str:
                 "- A tracking number will be emailed once the carrier picks up the shipment.",
                 "- Typical processing time before pickup: **1–3 business days**.",
                 "",
-                "We'll continue with your delivery warranty questions below.",
+                closing,
             ]
         )
         return "\n".join(lines)
@@ -274,12 +507,22 @@ def format_warranty_tracking_message(snapshot: TrackingSnapshot) -> str:
             lines.append(f"- {t} | {loc} | {msg}")
 
     lines.append("")
-    lines.append("We'll continue with your delivery warranty questions below.")
+    lines.append(closing)
     return "\n".join(lines)
 
 
-def persist_snapshot(ticket_id: str, snapshot: TrackingSnapshot) -> None:
+def persist_snapshot(
+    ticket_id: str,
+    snapshot: TrackingSnapshot,
+    *,
+    raw_input: str = "",
+    lookup_kind: str = "",
+) -> None:
+    from warranty_eligibility import evaluate_purchase_eligibility  # noqa: WPS433
     from warranty_models import WarrantyTicket, warranty_db_session  # noqa: WPS433
+
+    eligibility = evaluate_purchase_eligibility(snapshot.purchase_date)
+    order, email = parse_order_or_email(raw_input) if raw_input else ("", "")
 
     with warranty_db_session() as db:
         ticket = (
@@ -289,3 +532,69 @@ def persist_snapshot(ticket_id: str, snapshot: TrackingSnapshot) -> None:
         )
         if ticket:
             ticket.set_collected("tracking_snapshot", json.dumps(snapshot.to_dict()))
+            ticket.set_collected("warranty_eligibility", json.dumps(eligibility.to_dict()))
+            if eligibility.purchase_date_iso:
+                ticket.set_collected("purchase_date", eligibility.purchase_date_iso)
+            ticket.set_collected("warranty_eligibility_status", eligibility.status)
+            if raw_input.strip():
+                ticket.set_collected("delivery_lookup_input", raw_input.strip()[:200])
+            if lookup_kind:
+                ticket.set_collected("delivery_lookup_kind", lookup_kind)
+            ticket.set_collected(
+                "delivery_lookup_failed",
+                "0" if snapshot.available else "1",
+            )
+            if snapshot.available:
+                ticket.set_collected("delivery_lookup_error", "")
+            elif snapshot.error:
+                ticket.set_collected(
+                    "delivery_lookup_error",
+                    admin_lookup_failure_reason(snapshot.error)[:240],
+                )
+            if snapshot.tracking_number:
+                ticket.set_collected("tracking_number", snapshot.tracking_number)
+            elif lookup_kind == "tracking" and raw_input.strip():
+                ticket.set_collected("tracking_number", raw_input.strip()[:80])
+            if snapshot.order_number or order:
+                ticket.set_collected("order_number", snapshot.order_number or order)
+            if email:
+                ticket.set_collected("checkout_email", email)
+
+
+def append_eligibility_to_tracking_message(message: str, ticket_id: str) -> str:
+    """Append a soft eligibility note when purchase date was evaluated."""
+    from warranty_eligibility import customer_eligibility_note  # noqa: WPS433
+    from warranty_models import WarrantyTicket, warranty_db_session  # noqa: WPS433
+
+    with warranty_db_session() as db:
+        ticket = (
+            db.query(WarrantyTicket)
+            .filter(WarrantyTicket.ticket_id == ticket_id)
+            .first()
+        )
+        if ticket is None:
+            return message
+        raw = ticket.get_collected().get("warranty_eligibility")
+    if not raw:
+        return message
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return message
+    if not isinstance(data, dict):
+        return message
+    from warranty_eligibility import EligibilityResult  # noqa: WPS433
+
+    result = EligibilityResult(
+        status=str(data.get("status") or "unknown"),
+        purchase_date=str(data.get("purchase_date") or ""),
+        purchase_date_iso=str(data.get("purchase_date_iso") or ""),
+        eligibility_years=int(data.get("eligibility_years") or 3),
+        expires_on=str(data.get("expires_on") or ""),
+        days_remaining=data.get("days_remaining"),
+        summary=str(data.get("summary") or ""),
+    )
+    note = customer_eligibility_note(result)
+    if not note:
+        return message
+    return f"{message.rstrip()}{note}"

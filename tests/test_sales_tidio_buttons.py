@@ -1,0 +1,151 @@
+"""Tests for Tidio button flattening + label/number resolution."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+APP_DIR = Path(__file__).resolve().parent.parent / "app"
+sys.path.insert(0, str(APP_DIR))
+
+from sales_tidio_buttons import (  # noqa: E402
+    append_numbered_menu,
+    dropped_action_hint,
+    flatten_buttons_for_flow,
+    prioritize_quick_replies,
+    resolve_button_choice,
+)
+
+
+def test_prioritize_caps_and_prefers_shop():
+    raw = [
+        {"label": "Talk to a human", "payload": "human"},
+        {"label": "Specs", "payload": "specs:abc"},
+        {"label": "Shop this chair", "payload": "open:https://osakiusa.com/products/x"},
+        {"label": "Email me this pick", "payload": "lead:save_pick"},
+        {"label": "Prefer stronger", "payload": "recommend:intensity:strong"},
+        {"label": "Extra", "payload": "menu"},
+    ]
+    out = prioritize_quick_replies(raw, limit=5)
+    assert len(out) == 5
+    assert out[0]["payload"].startswith("open:")
+    assert any(b["payload"] == "lead:save_pick" for b in out)
+    assert out[-1]["payload"] == "human"
+    assert out[-1]["payload"] != "menu" or len(out) < 6
+
+
+def test_prioritize_keeps_resume_continue_and_human_last():
+    out = prioritize_quick_replies(
+        [
+            {"label": "Continue: Maestro 4D", "payload": "resume:continue"},
+            {"label": "Show my three picks", "payload": "resume:picks"},
+            {"label": "Start over", "payload": "resume:reset"},
+            {"label": "Talk to a human", "payload": "human"},
+        ],
+        limit=5,
+    )
+    assert out[0]["payload"] == "resume:continue"
+    assert out[-1]["payload"] == "human"
+    assert [b["payload"] for b in out] == [
+        "resume:continue",
+        "resume:picks",
+        "resume:reset",
+        "human",
+    ]
+
+
+def test_talk_to_a_human_is_never_the_first_choice():
+    """Tidio numbers the ranked list. Human at rank 35 used to become 1)."""
+    from sales_agent import _menu_quick_replies
+
+    out = prioritize_quick_replies(_menu_quick_replies(), limit=5)
+    assert out[0]["payload"] != "human"
+    assert out[-1]["payload"] == "human"
+    assert out[0]["payload"] == "recommend"
+
+
+def test_flatten_and_numbered_menu():
+    buttons = prioritize_quick_replies(
+        [
+            {"label": "Shop this chair", "payload": "open:https://osakiusa.com/products/x"},
+            {"label": "Email me this pick", "payload": "lead:save_pick"},
+        ]
+    )
+    flat = flatten_buttons_for_flow(buttons)
+    assert flat["button_count"] == 2
+    assert flat["button_1_label"] == "Shop this chair"
+    assert flat["button_1_url"].startswith("https://")
+    assert flat["button_3_label"] == ""
+
+    plain = append_numbered_menu("Here is your pick.", buttons)
+    assert "reply with the number:" in plain.lower()
+    assert "1) Shop this chair" in plain
+    assert "2) Email me this pick" in plain
+
+
+def test_resolve_number_and_label():
+    buttons = [
+        {"label": "Shop this chair", "payload": "open:https://osakiusa.com/products/x"},
+        {"label": "Email me this pick", "payload": "lead:save_pick"},
+        {"label": "Talk to a human", "payload": "human"},
+    ]
+    assert resolve_button_choice("1", buttons) == buttons[0]["payload"]
+    assert resolve_button_choice("1)", buttons) == buttons[0]["payload"]
+    assert resolve_button_choice("1.", buttons) == buttons[0]["payload"]
+    assert resolve_button_choice("2", buttons) == "lead:save_pick"
+    assert resolve_button_choice("Email me this pick", buttons) == "lead:save_pick"
+    assert resolve_button_choice("3) Talk to a human", buttons) == "human"
+    assert resolve_button_choice("something else", buttons) is None
+
+
+def test_resolve_falls_back_to_default_menu_when_session_lost():
+    assert resolve_button_choice("1", None) == "recommend"
+    assert resolve_button_choice("1.", []) == "recommend"
+    assert resolve_button_choice("2", None) == "stock"
+    assert resolve_button_choice("recommend", None) == "recommend"
+    assert resolve_button_choice("Recommend a chair", None) == "recommend"
+
+
+def test_recommend_results_keep_compare_not_email_under_tidio_cap():
+    raw = [
+        {"label": "Value: Champ", "payload": "tier:1"},
+        {"label": "Mid: Maestro", "payload": "tier:2"},
+        {"label": "Premium: Paragon", "payload": "tier:3"},
+        {"label": "Compare Value vs Mid", "payload": "compare:tiers:1:2"},
+        {"label": "Email me these picks", "payload": "lead:save_pick"},
+        {"label": "Talk to a human", "payload": "human"},
+    ]
+    out = prioritize_quick_replies(raw, limit=5)
+    payloads = [b["payload"] for b in out]
+    assert payloads[:3] == ["tier:1", "tier:2", "tier:3"]
+    assert "compare:tiers:1:2" in payloads
+    assert payloads[-1] == "human"
+    assert "lead:save_pick" not in payloads
+    hint = dropped_action_hint(raw, out)
+    assert "email" in hint.lower()
+
+
+def test_feedback_chips_survive_tidio_cap_on_rateable_replies():
+    out = prioritize_quick_replies(
+        [
+            {"label": "Recommend a chair", "payload": "recommend"},
+            {"label": "Visit showroom", "payload": "cta:showroom"},
+            {"label": "That helped", "payload": "feedback:up"},
+            {"label": "Not what I needed", "payload": "feedback:down"},
+            {"label": "Talk to a human", "payload": "human"},
+            {"label": "That's all I needed", "payload": "menu"},
+        ],
+        limit=5,
+    )
+    payloads = [b["payload"] for b in out]
+    assert "feedback:up" in payloads
+    assert "feedback:down" in payloads
+    assert payloads[-1] == "human"
+    assert "menu" not in payloads
+
+
+def test_typed_helpful_maps_to_feedback_without_chips():
+    assert resolve_button_choice("helpful", None) == "feedback:up"
+    assert resolve_button_choice("That helped", []) == "feedback:up"
+    assert resolve_button_choice("not helpful", None) == "feedback:down"
+    assert resolve_button_choice("Not what I needed", None) == "feedback:down"

@@ -1,4 +1,12 @@
-const DEFAULT_EVIDENCE_EMAIL = "service@osakititan.com";
+import {
+  WARRANTY_SUPPORT_EMAIL,
+  WARRANTY_SUPPORT_HOURS,
+  WARRANTY_SUPPORT_PHONE,
+} from "./warrantyContact";
+
+const DEFAULT_EVIDENCE_EMAIL = WARRANTY_SUPPORT_EMAIL;
+const DEFAULT_WARRANTY_PHONE = WARRANTY_SUPPORT_PHONE;
+const DEFAULT_WARRANTY_HOURS = WARRANTY_SUPPORT_HOURS;
 
 /** Standard warranty contact footer appended to terminal prompts. */
 export function buildWarrantyContactFooter(
@@ -6,8 +14,8 @@ export function buildWarrantyContactFooter(
 ): string {
   const email = evidenceEmail?.trim() || DEFAULT_EVIDENCE_EMAIL;
   return (
-    `For warranty support, contact us at ${email}.\n` +
-    `If you leave your email address, our warranty team will respond within 24 hours.`
+    `For warranty support, call ${DEFAULT_WARRANTY_PHONE} or email ${email}.\n` +
+    `Hours: ${DEFAULT_WARRANTY_HOURS}.`
   );
 }
 
@@ -20,7 +28,6 @@ export function buildEvidenceRequestMessage(
 ): string | null {
   if (!evidenceRequired?.length) return null;
 
-  const email = evidenceEmail?.trim() || DEFAULT_EVIDENCE_EMAIL;
   const hasVideo = evidenceRequired.includes("video_of_issue");
   const hasDamagePhotos =
     evidenceRequired.includes("damage_photos") ||
@@ -31,27 +38,44 @@ export function buildEvidenceRequestMessage(
 
   if (hasVideo) {
     if (hasDamagePhotos || hasOtherPhotos) {
-      return `Please send photos or a video of the issue to ${email}. You can also upload using the form below.`;
+      return (
+        `If you can, please share photos or a video of the issue using the form below. ` +
+        `If not, submit your email only — no photo or video required.`
+      );
     }
-    return `Please send a photo or video of the issue to ${email}. You can also upload using the form below.`;
+    return (
+      `If you can, please share a photo or video using the form below. ` +
+      `If not, submit your email only — no photo or video required.`
+    );
   }
 
   if (hasDamagePhotos || hasOtherPhotos) {
-    return `Please send the requested photos to ${email}. You can also upload using the form below.`;
+    return (
+      `If you can, please share the requested photos using the form below. ` +
+      `If not, submit your email only — no photo or video required.`
+    );
   }
 
-  return `Please send the requested files to ${email}. You can also upload using the form below.`;
+  return `Please submit your email using the form below so our team can follow up within 24 hours.`;
 }
 
-/** Remind customers that email is required when using the upload form. */
+/** Remind customers that email is the final step after the workflow completes. */
 export function buildEvidenceEmailRequiredNote(): string {
-  return "Please enter your email address in the upload form below — it is required so our team can follow up.";
+  return (
+    "As a final step, please enter your email address below so our team can follow up within 24 hours. " +
+    "Photos or videos are optional — you can submit with email only."
+  );
 }
 
 function appendEvidenceEmailRequired(text: string): string {
   const note = buildEvidenceEmailRequiredNote();
   const lower = text.toLowerCase();
-  if (lower.includes("email address in the upload form")) {
+  if (
+    lower.includes("final step") ||
+    lower.includes("email only") ||
+    lower.includes("email address in the upload form") ||
+    lower.includes("leave your email below")
+  ) {
     return text;
   }
   return `${text}\n\n${note}`;
@@ -60,10 +84,7 @@ function appendEvidenceEmailRequired(text: string): string {
 function appendWarrantyFooter(text: string, evidenceEmail?: string | null): string {
   const footer = buildWarrantyContactFooter(evidenceEmail);
   const lower = text.toLowerCase();
-  if (
-    lower.includes("within 24 hours") &&
-    lower.includes(DEFAULT_EVIDENCE_EMAIL)
-  ) {
+  if (lower.includes("888-848-2630") && lower.includes("hours:")) {
     return text;
   }
   return `${text}\n\n${footer}`;
@@ -73,8 +94,13 @@ function appendWarrantyFooter(text: string, evidenceEmail?: string | null): stri
 export function formatTerminalPrompt(
   prompt: string,
   evidenceRequired?: string[],
-  evidenceEmail?: string | null
+  evidenceEmail?: string | null,
+  assistantMessage?: string | null
 ): string {
+  if (assistantMessage?.trim()) {
+    return assistantMessage.trim();
+  }
+
   const lower = prompt.toLowerCase();
   const emailInPrompt = lower.includes("service@osakititan.com");
   const hasVideoEvidence = evidenceRequired?.includes("video_of_issue");
@@ -82,7 +108,7 @@ export function formatTerminalPrompt(
   if (emailInPrompt && hasVideoEvidence && !lower.includes("video")) {
     return appendEvidenceEmailRequired(
       appendWarrantyFooter(
-        `${prompt}\n\nPlease include a photo or video of the issue if possible. You can also upload using the form below.`,
+        `${prompt}\n\nIf you can, include a photo or video using the form below. Otherwise, submit your email only — no attachment required.`,
         evidenceEmail
       )
     );
@@ -91,7 +117,7 @@ export function formatTerminalPrompt(
   if (emailInPrompt && !hasVideoEvidence) {
     return appendEvidenceEmailRequired(
       appendWarrantyFooter(
-        `${prompt}\n\nYou can also upload using the form below.`,
+        `${prompt}\n\nPlease submit your email using the form below as the final step.`,
         evidenceEmail
       )
     );

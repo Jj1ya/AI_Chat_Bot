@@ -15,6 +15,7 @@ venv/
 .venv/
 env/
 pip-log.txt
+app/.vendor/
 
 # ==========================================
 # 3. Vector DB & Large Data (데이터베이스 및 대용량 파일)
@@ -24,6 +25,14 @@ pip-log.txt
 data/*
 !data/warranty_flowchart.json
 !data/warranty_evidence_specs.json
+!data/model_families.json
+!data/answer_quality_eval_cases.json
+!data/llm_eval_cases.json
+!data/fonz_error_codes.json
+!data/fonz_model_diagnostics.json
+!data/install_videos.json
+!data/sales/
+!data/sales/**
 faiss_index/
 *.jsonl
 *.faiss
@@ -31,6 +40,7 @@ faiss_index/
 # raw_data는 인제스터 소스 파일(스펙/상품)만 허용하고 나머지는 무시
 raw_data/*
 !raw_data/Specification_Massage Chair.xlsx
+!raw_data/Fonz's All-in-one Warranty List.xlsx
 !raw_data/products_export.csv
 !raw_data/Auto-Check.csv
 !raw_data/fault_judgment.csv
@@ -45,6 +55,8 @@ frontend/node_modules/
 frontend/.next/
 frontend/.env.local
 frontend/out/
+frontend/*.tsbuildinfo
+nohup.out
 
 # ==========================================
 # 5. OS Specific & IDE (운영체제 및 에디터 찌꺼기)
@@ -56,3 +68,7 @@ frontend/out/
 .vscode/
 .idea/faiss_index/
 db_data/
+rc_audio_cache/
+uploaded_evidence/
+backups/
+logs/
