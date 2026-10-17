@@ -120,7 +120,7 @@ uuid_utils==0.14.1
 uvicorn==0.42.0
 xlrd==2.0.2
 xxhash==3.6.0
-yarl==1.23.0
+yarl==1.25.1
 zstandard==0.25.0
 
 # --- RingCentral phone IVR ---
